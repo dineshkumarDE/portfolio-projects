@@ -1,1 +1,2 @@
 
+This project demonstrates an end-to-end data analytics workflow using Python, Snowflake, and SQL. We start by splitting a large JSON file into smaller, more manageable chunks using Python, optimizing data ingestion speeds. Next, the data is uploaded to Amazon S3 and then transferred into Snowflake for further analysis. Finally, we explore and answer insightful questions by querying the data using SQL.
