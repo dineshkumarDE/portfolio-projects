@@ -3,9 +3,8 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, TimestampType, DateType
 from pyspark.sql.functions import lit, col, current_timestamp, to_date
 from unittest.mock import patch, MagicMock
-from datetime import datetime # Keep this, good practice
+from datetime import datetime 
 
-# Import functions and schema from your module under test
 from transform_functions.ingest_products_data_functions import (
     load_raw_products_csv,
     standardize_products_columns,
@@ -16,8 +15,6 @@ from transform_functions.ingest_products_data_functions import (
 )
 
 from common.configurations import raw_folder_path
-# The add_ingestion_date function is imported into ingest_products_data_functions.py
-# so we will patch it there in the pipeline test.
 
 
 # --- Unit Tests ---

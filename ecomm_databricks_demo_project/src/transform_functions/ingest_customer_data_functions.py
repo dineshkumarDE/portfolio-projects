@@ -107,7 +107,7 @@ def ingest_customer_pipeline(spark, file_date: str, raw_path: str):
         df_renamed = customer_column_standardize(df_raw, file_date)
 
         # Step 3: Load to Raw Schema (if this is a separate staging step before final processing)
-        # Assuming this is intended to save to raw.customers first, then continue processing
+
         df_raw_final = load_customer_data(spark, "raw", df_renamed) # df_raw_final will be the df returned by load_customer_data
 
         # Step 4: Clean Data
@@ -123,5 +123,4 @@ def ingest_customer_pipeline(spark, file_date: str, raw_path: str):
         return df_final # Return the final DataFrame for potential inspection/chaining
     except Exception as e:
         print(f"CRITICAL ERROR: Customer ingestion pipeline failed for file date {file_date}. Reason: {e}")
-        # You might want to send an alert here (e.g., email, Slack message)
         raise # Re-raise the exception to signal pipeline failure

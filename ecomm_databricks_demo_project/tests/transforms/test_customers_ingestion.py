@@ -6,15 +6,10 @@ from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.types import StructType, StructField, StringType, LongType, IntegerType, DoubleType, DateType, TimestampType
 from pyspark.sql.functions import lit, col, year, current_timestamp, to_date
 import os
-from unittest.mock import patch, MagicMock, ANY # <--- ADDED: ANY for flexible DataFrame comparisons
-# Importing the actual functions from your source module (assuming its path)
-from transform_functions.ingest_customer_data_functions import customer_column_standardize, clean_customer_data, ingest_customer_pipeline, customer_schema, load_customer_data # <--- ADDED: load_customer_data for mocking
-# The line below is not directly used in this test file's functions, but if you're importing it,
-# it might be for a fixture or another test. If not used, it's harmless but could be removed.
+from unittest.mock import patch, MagicMock, ANY 
+from transform_functions.ingest_customer_data_functions import customer_column_standardize, clean_customer_data, ingest_customer_pipeline, customer_schema, load_customer_data 
+
 from pyspark.sql.functions import col, lit, date_add 
-# The common.functions.add_ingestion_date is explicitly imported here.
-# For patching, it's often safer to patch where it's *used* in the pipeline module,
-# not where it's imported in the test. We'll adjust the patch accordingly.
 from common.functions import add_ingestion_date 
 
 # --- Unit Tests ---
@@ -90,11 +85,9 @@ def test_add_ingestion_date_adds_column(spark_session: SparkSession, mock_raw_cu
     """
     Tests if the add_ingestion_date function correctly adds the column.
     """
-    print("Applying column standardization and adding file_date.") # Print for clarity
-    # Use a dummy DataFrame (transformed) to test add_ingestion_date
+    print("Applying column standardization and adding file_date.") 
     transformed_df = customer_column_standardize(mock_raw_customer_df, "2025-05-23")
     
-    # Capture time *before* calling the function
     start_time = datetime.now() 
     final_df = add_ingestion_date(transformed_df)
     end_time = datetime.now() 
@@ -103,36 +96,28 @@ def test_add_ingestion_date_adds_column(spark_session: SparkSession, mock_raw_cu
     assert final_df.schema["ingestion_date"].dataType == TimestampType()
     assert final_df.filter(col("ingestion_date").isNotNull()).count() == final_df.count()
 
-    # Get the actual ingestion date from the DataFrame, converting if necessary
+    # Get the actual ingestion date from the DataFrame
     actual_ingestion_date_spark = final_df.select("ingestion_date").first()[0]
-    # Spark TimestampType objects can sometimes be java.sql.Timestamp or Python datetime.
-    # For robust comparison, ensure it's a Python datetime.
+    
     if isinstance(actual_ingestion_date_spark, datetime):
         actual_ingestion_date = actual_ingestion_date_spark
     else:
-        # If it's a Spark Timestamp object (e.g., java.sql.Timestamp), convert it
-        # This conversion might vary based on your Spark setup.
-        # A common way is to cast to string and then parse, or assume PySpark handles it well.
-        # For this test, given current_timestamp() is from PySpark, direct comparison should work.
-        actual_ingestion_date = actual_ingestion_date_spark # Trusting Spark's conversion in test environment
-
-    # Ensure the captured timestamp is within a reasonable window of the test execution
-    # Added a small buffer (e.g., 5 seconds) to account for execution time
-    assert start_time <= actual_ingestion_date <= end_time + timedelta(seconds=5) # <--- Corrected the comparison for actual_ingestion_date
+       
+        actual_ingestion_date = actual_ingestion_date_spark 
+    assert start_time <= actual_ingestion_date <= end_time + timedelta(seconds=5) 
     print("add_ingestion_date test PASSED.")
 
 
 # --- End-to-End Pipeline Test (using mocks for external calls) ---
 
 @patch('transform_functions.ingest_customer_data_functions.load_raw_customer_excel') # Mock the external Excel loading
-# <--- IMPORTANT PATCH PATH CHANGE HERE ---
 # Patch add_ingestion_date where it is imported within ingest_customer_data_functions
 # Assuming ingest_customer_pipeline imports add_ingestion_date from common.functions,
 # and ingest_customer_data_functions has `from common.functions import add_ingestion_date`
-@patch('transform_functions.ingest_customer_data_functions.add_ingestion_date') # <--- CORRECTED PATCH PATH
-@patch('transform_functions.ingest_customer_data_functions.load_customer_data') # <--- ADDED: Patch load_customer_data
+@patch('transform_functions.ingest_customer_data_functions.add_ingestion_date') 
+@patch('transform_functions.ingest_customer_data_functions.load_customer_data') 
 def test_ingest_customer_pipeline_success(
-    mock_load_customer_data, # NEW: This argument for the patched load_customer_data
+    mock_load_customer_data, 
     mock_add_ingestion_date, 
     mock_load_raw_customer_excel, 
     spark_session,
@@ -141,7 +126,7 @@ def test_ingest_customer_pipeline_success(
     """
     Tests the full pipeline by mocking external dependencies.
     """
-    print(f"Starting customer ingestion pipeline for file date: 2025-05-23") # Print for clarity
+    print(f"Starting customer ingestion pipeline for file date: 2025-05-23")
     test_file_date = "2025-05-23"
     test_raw_path = "/mnt/raw_data_test"
 
@@ -151,8 +136,6 @@ def test_ingest_customer_pipeline_success(
     # Configure mock_add_ingestion_date to add the column dynamically
     mock_add_ingestion_date.side_effect = lambda df: df.withColumn("ingestion_date", current_timestamp())
 
-    # Configure mock_load_customer_data to just return the DataFrame it was given
-    # This simulates the behavior of your actual load_customer_data function
     mock_load_customer_data.side_effect = lambda spark, schemaname, df: df
 
 
@@ -164,30 +147,21 @@ def test_ingest_customer_pipeline_success(
     )
     
     # Assert that add_ingestion_date was called once
-    mock_add_ingestion_date.assert_called_once() # We expect it to be called with a DataFrame, but not checking exact content here
+    mock_add_ingestion_date.assert_called_once() 
 
     # Assert that load_customer_data was called twice
     assert mock_load_customer_data.call_count == 2
     
-    # Assert the first call to load_customer_data (saving to 'raw')
-    # The pipeline passes `df_renamed` to raw load, which is a transformed version of `mock_raw_customer_df`
-    # Use ANY for the DataFrame argument if the exact instance can vary after Spark operations.
-    # Alternatively, you could construct the expected DataFrame here based on `customer_column_standardize`
-    # For a robust check, you might check call arguments more generally or schema.
-    # Given the pipeline structure, the first call should be with `df_renamed`
-    # which is the output of `customer_column_standardize(mock_raw_customer_df, test_file_date)`
     first_call_df_arg = mock_load_customer_data.call_args_list[0].args[2]
     assert first_call_df_arg.schema.names == customer_column_standardize(mock_raw_customer_df, test_file_date).schema.names
     assert first_call_df_arg.count() == mock_raw_customer_df.count()
-    mock_load_customer_data.assert_any_call(spark_session, "raw", ANY) # More flexible assertion
+    mock_load_customer_data.assert_any_call(spark_session, "raw", ANY) 
 
-    # Assert the second call to load_customer_data (saving to 'processed')
-    # This call should use the final `result_df`
     second_call_df_arg = mock_load_customer_data.call_args_list[1].args[2]
     assert second_call_df_arg.schema.names == result_df.schema.names
     assert second_call_df_arg.count() == result_df.count()
     assert "ingestion_date" in second_call_df_arg.columns
-    mock_load_customer_data.assert_any_call(spark_session, "processed", ANY) # More flexible assertion
+    mock_load_customer_data.assert_any_call(spark_session, "processed", ANY) 
 
     # Assertions on the final DataFrame structure and data
     expected_final_columns = [
@@ -210,14 +184,12 @@ def test_ingest_customer_pipeline_success(
 
     ingestion_date_val = result_df.filter(col("customer_id") == "C001").select("ingestion_date").first()[0]
 
-    # Assertion 1: Check type - use TimestampType().pythonClass for Python datetime object
+  
     assert isinstance(ingestion_date_val, datetime)
-    
-    # Assertion 2: Check freshness of the ingestion date (within a short window)
+
     now = datetime.now()
-    # It's better to ensure ingestion_date_val is a Python datetime before subtraction.
-    # If it's a PySpark TimestampType.pythonClass, it usually behaves like a datetime.
-    assert now - timedelta(seconds=5) <= ingestion_date_val <= now + timedelta(seconds=5) # <--- Refined freshness check
+
+    assert now - timedelta(seconds=5) <= ingestion_date_val <= now + timedelta(seconds=5)
     
     print("Customer ingestion pipeline completed successfully for file date: 2025-05-23")
-    print("Assertion passed for dynamic timestamp!") # This print statement was already there.
+    print("Assertion passed for dynamic timestamp!")

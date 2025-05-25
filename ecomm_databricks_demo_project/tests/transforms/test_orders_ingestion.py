@@ -1,27 +1,19 @@
 import pytest
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, DateType, TimestampType
-from pyspark.sql.functions import lit, col, current_timestamp, round, to_date # Import to_date for date conversion
+from pyspark.sql.functions import lit, col, current_timestamp, round, to_date 
 from unittest.mock import patch, MagicMock
-from datetime import datetime # ADDED: Import datetime for NameError fix
+from datetime import datetime 
 
-# Import functions from your module under test
 from transform_functions.ingest_orders_data_functions import (
     load_raw_orders_json,
     standardize_orders_columns,
-    clean_and_transform_orders_data, # Ensure this is imported
+    clean_and_transform_orders_data, 
     load_orders_data,
     ingest_orders_pipeline,
-    orders_schema # Import the schema defined in the original file
+    orders_schema 
 )
-# It's better to patch add_ingestion_date from common.functions if that's its origin.
-# However, if ingest_orders_data_functions.py imports it, then patch it there.
-# Based on your provided original file: 'from common.functions import add_ingestion_date'
-# So, the patch in the pipeline test should be where it's imported into ingest_orders_data_functions.py
-# For other tests, we'll let it be.
-
-from common.configurations import raw_folder_path # Assuming this is correctly defined
-
+from common.configurations import raw_folder_path 
 
 # --- Unit Tests ---
 
@@ -90,9 +82,9 @@ def test_standardize_orders_columns(spark_session: SparkSession, mock_raw_orders
         (50.000, 50.00),
         (7.89, 7.89),
         (12.3, 12.30),
-        (0.005, 0.01), # Test rounding up
-        (0.004, 0.00), # Test rounding down
-        (None, None)   # Test null handling
+        (0.005, 0.01),
+        (0.004, 0.00),
+        (None, None)   
     ]
 )
 def test_clean_and_transform_orders_data_profit_rounding_parametrized(
@@ -118,7 +110,6 @@ def test_clean_and_transform_orders_data_profit_rounding_parametrized(
 
     assert actual_profit == expected_profit
 
-# --- FIXED: Only one test_load_orders_data_saves_to_delta, using MagicMock for df input ---
 def test_load_orders_data_saves_to_delta(spark_session: SparkSession):
     """
     Tests if the load_orders_data function attempts to save to a Delta table
@@ -127,8 +118,7 @@ def test_load_orders_data_saves_to_delta(spark_session: SparkSession):
     target_schema_name = "test_target_schema"
 
     # Create a MagicMock to act as the DataFrame passed to load_orders_data
-    mock_df_to_save = MagicMock(spec=DataFrame) # Use spec=DataFrame for better type checking on mock
-
+    mock_df_to_save = MagicMock(spec=DataFrame) 
     # Set up the chain for the mock_df_to_save's .write method
     mock_format_chain = MagicMock()
     mock_mode_chain = MagicMock()
@@ -154,7 +144,6 @@ def test_load_orders_data_saves_to_delta(spark_session: SparkSession):
 @patch('transform_functions.ingest_orders_data_functions.clean_and_transform_orders_data')
 @patch('transform_functions.ingest_orders_data_functions.standardize_orders_columns')
 @patch('transform_functions.ingest_orders_data_functions.load_raw_orders_json')
-# Correct patch path for add_ingestion_date: it's imported into ingest_orders_data_functions.py
 @patch('transform_functions.ingest_orders_data_functions.add_ingestion_date')
 def test_ingest_orders_pipeline_orchestration(
     mock_add_ingestion_date,
