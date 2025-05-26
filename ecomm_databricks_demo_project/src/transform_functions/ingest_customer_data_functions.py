@@ -1,5 +1,3 @@
-# Databricks notebook source
-
 from pyspark.sql.types import StructType, StructField, StringType, DateType
 from pyspark.sql.functions import lit, col, coalesce, when, to_date
 from common.functions import add_ingestion_date
