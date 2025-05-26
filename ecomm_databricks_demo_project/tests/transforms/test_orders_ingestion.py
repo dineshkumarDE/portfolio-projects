@@ -3,7 +3,7 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, DateType, TimestampType
 from pyspark.sql.functions import lit, col, current_timestamp, round, to_date 
 from unittest.mock import patch, MagicMock
-from datetime import datetime 
+from datetime import datetime,date 
 
 from transform_functions.ingest_orders_data_functions import (
     load_raw_orders_json,
@@ -47,7 +47,7 @@ def test_load_raw_orders_json_success(spark_session: SparkSession, mock_raw_orde
 
         assert df is mock_raw_orders_df
         assert df.count() == mock_raw_orders_df.count()
-        assert df.count() == 5
+        assert df.count() == 10
         assert df.schema == orders_schema
 
 
@@ -67,13 +67,14 @@ def test_standardize_orders_columns(spark_session: SparkSession, mock_raw_orders
     assert all(col_name in df_renamed.columns for col_name in expected_cols)
     assert "Row ID" not in df_renamed.columns
 
-    assert df_renamed.filter(col("file_date") == to_date(lit(test_file_date), "yyyy-MM-dd")).count() == df_renamed.count()
+    assert df_renamed.filter(col("file_date") == date.fromisoformat(test_file_date)).count() == df_renamed.count()
     assert isinstance(df_renamed.schema["file_date"].dataType, DateType)
 
     price_value = df_renamed.filter(col("order_id") == "O1").select("price").collect()[0][0]
     assert price_value == 100.0
 
 
+# Fix the parameterized test for profit rounding and null handling
 @pytest.mark.parametrize(
     "input_profit, expected_profit",
     [
@@ -84,7 +85,9 @@ def test_standardize_orders_columns(spark_session: SparkSession, mock_raw_orders
         (12.3, 12.30),
         (0.005, 0.01),
         (0.004, 0.00),
-        (None, None)   
+        # This is the crucial change: if input_profit is None, your coalesce(col("profit"), lit(0.0))
+        # will convert it to 0.0 before rounding. So, the expected_profit is 0.0.
+        (None, 0.0) # <--- FIXED THIS: It should be 0.0, not None, due to your coalesce logic.
     ]
 )
 def test_clean_and_transform_orders_data_profit_rounding_parametrized(
@@ -93,22 +96,73 @@ def test_clean_and_transform_orders_data_profit_rounding_parametrized(
     expected_profit: float
 ):
     """
-    Tests if profit values are correctly rounded to 2 decimal places using parametrization.
-    Each test case creates a minimal DataFrame to isolate the profit rounding logic.
+    Tests if profit values are correctly rounded to 2 decimal places and
+    null profits are handled, using parametrization.
+    Each test case creates a minimal DataFrame *with all expected columns*
+    to isolate the profit logic.
     """
-    data = [("dummy_order_id", input_profit)]
+    
+    raw_data = [
+        (
+            1,                # Row ID
+            "dummy_order_id", # Order ID
+            "2024-01-01",     # Order Date (as string, matching how you load raw data then standardize)
+            "2024-01-05",     # Ship Date
+            "Standard Class", # Ship Mode
+            "C_dummy",        # Customer ID
+            "P_dummy",        # Product ID
+            1,                # Quantity
+            10.0,             # Price
+            0.0,              # Discount
+            input_profit      # Profit (this is the one we're testing)
+        )
+    ]
 
     input_schema_for_cleaning = StructType([
+        StructField("row_id", IntegerType(), False),
         StructField("order_id", StringType(), False),
-        StructField("profit", DoubleType(), True)
+        StructField("order_date", DateType(), True), # Your `clean_and_transform_orders_data` directly uses DateType for this
+        StructField("ship_date", DateType(), True),
+        StructField("ship_mode", StringType(), True),
+        StructField("customer_id", StringType(), False),
+        StructField("product_id", StringType(), False),
+        StructField("quantity", IntegerType(), True),
+        StructField("price", DoubleType(), True),
+        StructField("discount", DoubleType(), True),
+        StructField("profit", DoubleType(), True),
+        StructField("file_date", DateType(), True) # Also required if standardize_orders_columns adds it.
     ])
-    df_input_for_cleaning = spark_session.createDataFrame(data, schema=input_schema_for_cleaning)
 
-    df_cleaned = clean_and_transform_orders_data(df_input_for_cleaning)
 
-    actual_profit = df_cleaned.select("profit").collect()[0][0]
 
-    assert actual_profit == expected_profit
+    data_for_cleaning_function = [
+        (
+            1,                # row_id
+            "dummy_order_id", # order_id
+            date(2024, 1, 1), # order_date (as Date object for direct schema match)
+            date(2024, 1, 5), # ship_date
+            "Standard Class", # ship_mode
+            "C_dummy",        # customer_id
+            "P_dummy",        # product_id
+            1,                # quantity
+            10.0,             # price
+            0.0,              # discount
+            input_profit,     # profit
+            date(2025, 5, 23) # file_date (dummy value for this test)
+        )
+    ]
+
+    df_input_for_cleaning_function = spark_session.createDataFrame(data_for_cleaning_function, schema=input_schema_for_cleaning)
+
+    # Call the function under test
+    df_cleaned = clean_and_transform_orders_data(df_input_for_cleaning_function)
+
+    # Collect result
+    result_profit = df_cleaned.select("profit").collect()[0]["profit"]
+
+    # Assert
+    assert result_profit == expected_profit
+
 
 def test_load_orders_data_saves_to_delta(spark_session: SparkSession):
     """

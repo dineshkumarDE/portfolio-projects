@@ -59,7 +59,7 @@ def clean_and_transform_products_data(df_products_transformed: DataFrame) -> Dat
     try:
         print("Applying data cleaning and specific transformations for products.")
         # Fill null 'price_per_product' with 0
-        df_cleaned = df_products_transformed.fillna({'price_per_product': 0})
+        df_cleaned = df_products_transformed.fillna({'price_per_product': 0},{'category': 'unknown', 'sub_category': 'unknown', 'product_name': 'unknown', 'state': 'unknown'})
         # Add any other cleaning logic specific to products here
         return df_cleaned
     except Exception as e:

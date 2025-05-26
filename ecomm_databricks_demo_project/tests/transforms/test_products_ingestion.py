@@ -46,7 +46,7 @@ def test_load_raw_products_csv_success(spark_session: SparkSession, mock_raw_pro
 
         assert df is mock_raw_products_df
         assert df.count() == mock_raw_products_df.count()
-        assert df.count() == 5
+        assert df.count() == 6
         assert df.schema == products_schema
 
 

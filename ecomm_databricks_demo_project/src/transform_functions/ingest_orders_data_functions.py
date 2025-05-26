@@ -2,19 +2,20 @@ from pyspark.sql.types import StructType, StructField, StringType, LongType, Int
 from pyspark.sql.functions import lit, col, count, when, coalesce, round, to_date
 from common.functions import add_ingestion_date
 from pyspark.sql import DataFrame
+
 # Define the schema for the orders data
 orders_schema = StructType([
     StructField("Row ID", IntegerType(), False),
     StructField("Order ID", StringType(), False),
-    StructField("Order Date", DateType(), False),
-    StructField("Ship Date", DateType(), False),
-    StructField("Ship Mode", StringType(), False),
+    StructField("Order Date", DateType(), True),
+    StructField("Ship Date", DateType(), True),
+    StructField("Ship Mode", StringType(), True),
     StructField("Customer ID", StringType(), False),
     StructField("Product ID", StringType(), False),
-    StructField("Quantity", IntegerType(), False),
-    StructField("Price", DoubleType(), False), # Assuming 'Price' maps to 'Sales' in your current code
-    StructField("Discount", DoubleType(), False),
-    StructField("Profit", DoubleType(), False)
+    StructField("Quantity", IntegerType(), True),
+    StructField("Price", DoubleType(), True), 
+    StructField("Discount", DoubleType(), True),
+    StructField("Profit", DoubleType(), True)
 ])
 
 def load_raw_orders_json(spark, file_date: str, raw_path: str, schema: StructType) -> DataFrame:
@@ -55,7 +56,7 @@ def standardize_orders_columns(df_orders_raw: DataFrame, file_date: str) -> Data
             .withColumnRenamed("Quantity", "quantity") \
             .withColumnRenamed("Discount", "discount") \
             .withColumnRenamed("Profit", "profit") \
-            .withColumn("file_date", to_date(lit(file_date), "yyyyMMdd"))
+            .withColumn("file_date", to_date(lit(file_date), "yyyy-MM-dd"))
         return df_orders_renamed
     except Exception as e:
         print(f"ERROR: Failed during column standardization or adding file_date. Reason: {e}")
@@ -68,9 +69,14 @@ def clean_and_transform_orders_data(df_orders_transformed: DataFrame) -> DataFra
     """
     try:
         print("Applying data cleaning and specific transformations for orders.")
-        # Example: Round profit to 2 decimal places
-        df_cleaned = df_orders_transformed.withColumn("profit", round(col("profit"), 2))
-        # Add any other cleaning logic specific to orders here (e.g., handling nulls)
+        df_cleaned = df_orders_transformed \
+            .withColumn("order_date", coalesce(col("order_date"), lit("1900-01-01").cast(DateType()))) \
+            .withColumn("ship_date", coalesce(col("ship_date"), lit("1900-01-01").cast(DateType()))) \
+            .withColumn("ship_mode", coalesce(col("ship_mode"), lit("unknown"))) \
+            .withColumn("quantity", coalesce(col("quantity"), lit(0))) \
+            .withColumn("price", coalesce(col("price"), lit(0.0))) \
+            .withColumn("discount", coalesce(col("discount"), lit(0.0))) \
+            .withColumn("profit", round(coalesce(col("profit"), lit(0.0)), 2))
         return df_cleaned
     except Exception as e:
         print(f"ERROR: Failed during data cleaning or transformation. Reason: {e}")
@@ -83,7 +89,6 @@ def load_orders_data(spark, schemaname: str, df: DataFrame) -> DataFrame:
     try:
         full_table_name = f"{schemaname}.orders"
         print(f"Attempting to save data to table: {full_table_name}")
-        # Using .option("overwriteSchema", "true") to allow schema evolution in Delta
         df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(full_table_name)
         print(f"Successfully saved data to {full_table_name}")
         return df

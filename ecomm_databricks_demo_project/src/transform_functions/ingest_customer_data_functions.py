@@ -33,9 +33,8 @@ def load_raw_customer_excel(spark, file_date: str, raw_path: str, schema: Struct
         print(f"Successfully loaded {df_raw.count()} rows from Excel.")
         return df_raw
     except Exception as e:
-        # This is critical for external file loading errors (file not found, corrupt, permission issues)
         print(f"ERROR: Failed to load Excel file from {file_path}. Reason: {e}")
-        raise RuntimeError(f"Excel file loading failed: {e}") # Re-raise as a more specific error
+        raise RuntimeError(f"Excel file loading failed: {e}") 
 
 def customer_column_standardize(df_customer_raw, file_date: str):
     """
@@ -55,26 +54,25 @@ def customer_column_standardize(df_customer_raw, file_date: str):
         return df_customer_renamed
     except Exception as e:
         print(f"ERROR: Failed during column standardization or adding file_date. Reason: {e}")
-        raise # Re-raise to indicate transformation failure
+        raise 
 
 def clean_customer_data(df_customer_transformed):
-    """
-    Applies data cleaning logic for customer_name and phone.
-    """
     try:
-        print("Applying data cleaning for customer_name and phone.")
+        for field in df_customer_transformed.schema.fields:
+            if isinstance(field.dataType, StringType) and field.nullable:
+                df_customer_transformed = df_customer_transformed.withColumn(
+                    field.name,
+                    coalesce(col(field.name), lit("unknown"))
+                )
+
         df_customer_cleaned = df_customer_transformed.withColumn(
-            "customer_name",
-            coalesce(col("customer_name"), lit("unknown"))
-        ).withColumn(
             "phone",
             when(col("phone") == "#ERROR!", "unknown").otherwise(col("phone"))
         )
         return df_customer_cleaned
     except Exception as e:
-        print(f"ERROR: Failed during data cleaning. Reason: {e}")
-        raise # Re-raise to indicate transformation failure
-
+        raise
+    
 def load_customer_data(spark, schemaname: str, df):
     """
     Loads data into raw & processed schema.
