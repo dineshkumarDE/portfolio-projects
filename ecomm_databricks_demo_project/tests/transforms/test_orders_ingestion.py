@@ -85,9 +85,7 @@ def test_standardize_orders_columns(spark_session: SparkSession, mock_raw_orders
         (12.3, 12.30),
         (0.005, 0.01),
         (0.004, 0.00),
-        # This is the crucial change: if input_profit is None, your coalesce(col("profit"), lit(0.0))
-        # will convert it to 0.0 before rounding. So, the expected_profit is 0.0.
-        (None, 0.0) # <--- FIXED THIS: It should be 0.0, not None, due to your coalesce logic.
+        (None, 0.0) 
     ]
 )
 def test_clean_and_transform_orders_data_profit_rounding_parametrized(
@@ -164,6 +162,7 @@ def test_clean_and_transform_orders_data_profit_rounding_parametrized(
     assert result_profit == expected_profit
 
 
+
 def test_load_orders_data_saves_to_delta(spark_session: SparkSession):
     """
     Tests if the load_orders_data function attempts to save to a Delta table
@@ -176,12 +175,17 @@ def test_load_orders_data_saves_to_delta(spark_session: SparkSession):
     # Set up the chain for the mock_df_to_save's .write method
     mock_format_chain = MagicMock()
     mock_mode_chain = MagicMock()
-    mock_option_chain = MagicMock() # For the .option() call
+    mock_option_chain_overwriteSchema = MagicMock() # For the first .option() call
+    mock_option_chain_partitionBy = MagicMock() # For the .partitionBy() call
 
     mock_df_to_save.write.format.return_value = mock_format_chain
     mock_format_chain.mode.return_value = mock_mode_chain
-    mock_mode_chain.option.return_value = mock_option_chain
-    mock_option_chain.saveAsTable.return_value = None # saveAsTable usually returns None
+    mock_mode_chain.option.return_value = mock_option_chain_overwriteSchema
+    
+    # Add the mock for partitionBy. It should be called after .option("overwriteSchema", "true")
+    mock_option_chain_overwriteSchema.partitionBy.return_value = mock_option_chain_partitionBy 
+    
+    mock_option_chain_partitionBy.saveAsTable.return_value = None # saveAsTable usually returns None
 
     # Call the function under test with the mocked DataFrame
     load_orders_data(spark_session, target_schema_name, mock_df_to_save)
@@ -189,11 +193,17 @@ def test_load_orders_data_saves_to_delta(spark_session: SparkSession):
     # Assertions
     mock_df_to_save.write.format.assert_called_once_with("delta")
     mock_format_chain.mode.assert_called_once_with("overwrite")
-    mock_mode_chain.option.assert_called_once_with("overwriteSchema", "true") # Assert for option call
-    mock_option_chain.saveAsTable.assert_called_once_with(f"{target_schema_name}.orders")
+    
+    # Assert for the first option call
+    mock_mode_chain.option.assert_called_once_with("overwriteSchema", "true") 
+    
+    # Assert for the partitionBy call
+    mock_option_chain_overwriteSchema.partitionBy.assert_called_once_with("file_date")
+
+    # Assert for the saveAsTable call, which is now on mock_option_chain_partitionBy
+    mock_option_chain_partitionBy.saveAsTable.assert_called_once_with(f"{target_schema_name}.orders")
 
 
-# --- FIXED: Updated patch path for add_ingestion_date based on original file ---
 @patch('transform_functions.ingest_orders_data_functions.load_orders_data')
 @patch('transform_functions.ingest_orders_data_functions.clean_and_transform_orders_data')
 @patch('transform_functions.ingest_orders_data_functions.standardize_orders_columns')

@@ -99,36 +99,43 @@ def test_clean_and_transform_products_data_fillna_price(spark_session: SparkSess
 
 def test_load_products_data_saves_to_delta(spark_session: SparkSession):
     """
-    Tests if the load_products_data function attempts to save to a Delta table
-    with the correct table name and mode, using a mocked DataFrame input.
+    Tests if the load_products_data function (with its original signature)
+    attempts to save to a Delta table with the correct chain of calls,
+    including .partitionBy("file_date").
     """
     target_schema_name = "test_target_schema"
+    expected_partition_column = "file_date" # The column expected to be used for partitioning
 
     mock_df_to_save = MagicMock(spec=DataFrame)
 
-    # FIX: Explicitly create a mock for the .write attribute and assign it
+    # Explicitly create mocks for the chain of calls
     mock_df_write = MagicMock()
-    mock_df_to_save.write = mock_df_write
+    mock_df_to_save.write = mock_df_write # df.write
 
-    # Wire up the chain on the *mock_df_write* object
-    mock_format_chain = MagicMock()
-    mock_mode_chain = MagicMock()
-    mock_option_chain = MagicMock() # For the .option() call
+    mock_format_chain = MagicMock()    # .format() returns this
+    mock_mode_chain = MagicMock()      # .mode() returns this
+    mock_option_chain = MagicMock()    # .option() returns this
+    mock_partition_chain = MagicMock() # .partitionBy() returns this 
 
+    # Wire up the chain of return values to simulate the call sequence
     mock_df_write.format.return_value = mock_format_chain
     mock_format_chain.mode.return_value = mock_mode_chain
-    mock_mode_chain.option.return_value = mock_option_chain # .mode().option() returns this
-    mock_option_chain.saveAsTable.return_value = None # .option().saveAsTable() returns None
+    mock_mode_chain.option.return_value = mock_option_chain
+    mock_option_chain.partitionBy.return_value = mock_partition_chain
+    mock_partition_chain.saveAsTable.return_value = None 
 
-    # Call the function under test with the mocked DataFrame
     load_products_data(spark_session, target_schema_name, mock_df_to_save)
 
-    # --- Assertions ---
-    # Verify the full chain of calls, starting from mock_df_write
     mock_df_write.format.assert_called_once_with("delta")
     mock_format_chain.mode.assert_called_once_with("overwrite")
-    mock_mode_chain.option.assert_called_once_with("overwriteSchema", "true") # This assertion should now pass
-    mock_option_chain.saveAsTable.assert_called_once_with(f"{target_schema_name}.products")
+    mock_mode_chain.option.assert_called_once_with("overwriteSchema", "true")
+
+    mock_option_chain.partitionBy.assert_called_once_with(expected_partition_column)
+
+    mock_partition_chain.saveAsTable.assert_called_once_with(f"{target_schema_name}.products")
+
+    print("\nTest passed: load_products_data saving chain (with internal partitioning) verified correctly!")
+
 
 @patch('transform_functions.ingest_products_data_functions.load_products_data')
 @patch('transform_functions.ingest_products_data_functions.clean_and_transform_products_data')

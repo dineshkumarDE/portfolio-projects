@@ -89,7 +89,7 @@ def load_orders_data(spark, schemaname: str, df: DataFrame) -> DataFrame:
     try:
         full_table_name = f"{schemaname}.orders"
         print(f"Attempting to save data to table: {full_table_name}")
-        df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(full_table_name)
+        df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").partitionBy("file_date").saveAsTable(full_table_name)
         print(f"Successfully saved data to {full_table_name}")
         return df
     except Exception as e:

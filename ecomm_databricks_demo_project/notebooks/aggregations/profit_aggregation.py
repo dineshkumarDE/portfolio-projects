@@ -70,12 +70,12 @@ df_combined_data_for_agg = spark.read.format("delta").table("processed.ecomm_com
 
 # Aggregate profit using the new function
 df_profit_agg = aggregate_profit(df_combined_data_for_agg)
-
-df_profit_agg.write.mode("overwrite").format("delta").saveAsTable("presentation.ecomm_profit_agg")
+partition_cols = ["order_year", "category", "sub_category"]
+df_profit_agg.write.mode("overwrite").format("delta").partitionBy(*partition_cols).option("overwriteSchema", "true").saveAsTable("presentation.ecomm_profit_agg")
 
 # COMMAND ----------
 
-DeltaTable.forName(spark, "presentation.ecomm_profit_agg").optimize().executeZOrderBy("customer_id", "order_year", "category", "sub_category")
+DeltaTable.forName(spark, "presentation.ecomm_profit_agg").optimize().executeZOrderBy("customer_id")
 
 # COMMAND ----------
 
