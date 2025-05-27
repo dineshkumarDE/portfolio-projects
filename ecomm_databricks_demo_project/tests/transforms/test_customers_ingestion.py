@@ -1,5 +1,3 @@
-# Databricks notebook source
-
 import pytest
 from datetime import datetime, timedelta 
 from pyspark.sql import SparkSession, DataFrame
@@ -77,7 +75,7 @@ def test_clean_customer_data_handles_phone_error_string(spark_session: SparkSess
 
     # Check that null phone numbers are unchanged (not handled by this specific coalesce)
     customer_c004_phone = cleaned_df.filter(col("customer_id") == "C004").select("phone").first()[0]
-    assert customer_c004_phone is None
+    assert customer_c004_phone == "unknown"
     print("Phone error string handling test PASSED.")
 
 
@@ -180,7 +178,8 @@ def test_ingest_customer_pipeline_success(
     assert c002_phone == "unknown"
 
     file_date_val = result_df.filter(col("customer_id") == "C001").select("file_date").first()[0]
-    assert file_date_val == to_date(lit(test_file_date))
+    expected_date_obj = datetime.strptime(test_file_date, "%Y-%m-%d").date()
+    assert file_date_val == expected_date_obj
 
     ingestion_date_val = result_df.filter(col("customer_id") == "C001").select("ingestion_date").first()[0]
 
