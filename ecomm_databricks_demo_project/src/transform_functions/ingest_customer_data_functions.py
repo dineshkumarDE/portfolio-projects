@@ -1,10 +1,17 @@
-from pyspark.sql.types import StructType, StructField, StringType, DateType
-from pyspark.sql.functions import lit, col, coalesce, when, to_date
+from pyspark.sql.types import StructType, StructField, StringType, DateType, ArrayType, BooleanType, TimestampType
+from pyspark.sql.functions import lit, col, coalesce, when, to_date, array_union, array, size, regexp_extract, length, count, regexp_replace, md5, concat_ws, current_date, date_sub, current_timestamp
 from common.functions import add_ingestion_date
+from pyspark.sql import DataFrame
+import logging
+import os
+from datetime import datetime
+from delta.tables import DeltaTable
 
+app_logger = logging.getLogger("EcommIngestionPipeline")
 
+# Define the schema for the customers data (raw layer)
 customer_schema = StructType([
-    StructField("Customer ID", StringType(), False),
+    StructField("Customer ID", StringType(), True), # will be checked for nulls and rejected
     StructField("Customer Name", StringType(), True),
     StructField("email", StringType(), True),
     StructField("phone", StringType(), True),
@@ -17,31 +24,78 @@ customer_schema = StructType([
     StructField("Region", StringType(), True)
 ])
 
-def load_raw_customer_excel(spark, file_date: str, raw_path: str, schema: StructType):
+# Schema for the processed customers table (including SCD Type 2 attributes)
+# This schema will be used when writing to the 'processed' Delta table
+processed_customer_schema = StructType([
+    StructField("customer_id", StringType(), False),
+    StructField("customer_name", StringType(), True),
+    StructField("email", StringType(), True),
+    StructField("phone", StringType(), True),
+    StructField("address", StringType(), True),
+    StructField("segment", StringType(), True),
+    StructField("country", StringType(), True),
+    StructField("city", StringType(), True),
+    StructField("state", StringType(), True),
+    StructField("postal_code", StringType(), True),
+    StructField("region", StringType(), True),
+    StructField("file_date", DateType(), False), # Date of the source file ingestion
+    StructField("dq_issues", ArrayType(StringType()), True), # Data Quality issues column
+    StructField("ingestion_timestamp", TimestampType(), False), # Renamed from ingestion_date to ingestion_timestamp
+    StructField("effective_start_date", DateType(), False), # SCD Type 2 start date
+    StructField("effective_end_date", DateType(), True),    # SCD Type 2 end date
+    StructField("is_current", BooleanType(), False),        # SCD Type 2 current flag
+    StructField("last_updated_timestamp", TimestampType(), False) # Timestamp when this record was last modified in the processed layer
+])
+
+
+def load_raw_customer_excel(spark, file_date: str, raw_path: str, schema: StructType) -> DataFrame:
     """
     Loads raw customer data from an Excel file.
+    
+    Args:
+        spark: The SparkSession object.
+        file_date (str): The date string for the file path (e.g., "2023-01-15").
+        raw_path (str): The base path to the raw data directory.
+        schema (StructType): The defined schema for the customer data.
+
+    Returns:
+        DataFrame: A DataFrame containing the raw customer data.
+
+    Raises:
+        RuntimeError: If the Excel file loading fails.
     """
     file_path = f"{raw_path}/{file_date}/Customer.xlsx"
     try:
-        print(f"Attempting to load Excel file from: {file_path}")
+        app_logger.info(f"Attempting to load Excel file from: {file_path}")
         df_raw = spark.read \
             .format("com.crealytics.spark.excel") \
             .option("header", "true") \
             .schema(schema) \
             .option("sheetName", "Worksheet") \
             .load(file_path)
-        print(f"Successfully loaded {df_raw.count()} rows from Excel.")
+        app_logger.info(f"Successfully loaded {df_raw.count()} rows from Excel.")
         return df_raw
     except Exception as e:
-        print(f"ERROR: Failed to load Excel file from {file_path}. Reason: {e}")
+        app_logger.error(f"Failed to load Excel file from {file_path}. Reason: {e}")
         raise RuntimeError(f"Excel file loading failed: {e}") 
 
-def customer_column_standardize(df_customer_raw, file_date: str):
+def customer_column_standardize(df_customer_raw: DataFrame, file_date: str) -> DataFrame:
     """
-    Applies renaming and adds file_date column.
+    Applies column renaming for standardization (converting "Camel Case" to "snake_case")
+    and adds the 'file_date' column.
+    
+    Args:
+        df_customer_raw (DataFrame): The raw customer DataFrame.
+        file_date (str): The date string to be added as 'file_date' column.
+
+    Returns:
+        DataFrame: The DataFrame with standardized column names and 'file_date'.
+
+    Raises:
+        Exception: If column standardization or adding file_date fails.
     """
     try:
-        print("Applying column standardization and adding file_date.")
+        app_logger.info("Applying column standardization and adding file_date.")
         df_customer_renamed = df_customer_raw.withColumnRenamed("Customer ID", "customer_id") \
             .withColumnRenamed("Customer Name", "customer_name") \
             .withColumnRenamed("Segment", "segment") \
@@ -53,11 +107,70 @@ def customer_column_standardize(df_customer_raw, file_date: str):
             .withColumn("file_date", to_date(lit(file_date), 'yyyy-MM-dd'))
         return df_customer_renamed
     except Exception as e:
-        print(f"ERROR: Failed during column standardization or adding file_date. Reason: {e}")
+        app_logger.error(f"Failed during column standardization or adding file_date. Reason: {e}")
         raise 
 
-def clean_customer_data(df_customer_transformed):
+def handle_customer_id_nulls(spark, df: DataFrame, reject_folder_path: str, file_date: str,dbutils_instance) -> DataFrame:
+    """
+    Checks for null values in the 'customer_id' column.
+    Records with null 'customer_id' are rejected and saved to a reject folder,
+    while valid records are returned.
+    """
+    app_logger.info("Checking for nulls in the 'customer_id' column.")
+
+    # Define the condition for rejection: if customer_id is null
+    reject_condition = col("customer_id").isNull()
+
+    df_rejected = df.filter(reject_condition)
+    df_valid = df.filter(~reject_condition) # ~ is the NOT operator
+
+    rejected_count = df_rejected.count()
+    total_count = df.count()
+
+    if rejected_count > 0:
+        reject_output_path = os.path.join(reject_folder_path, file_date, "customer")
+        app_logger.warning(f"Found {rejected_count} records with null 'customer_id' out of {total_count} total records.")
+        app_logger.info(f"Saving rejected records to: {reject_output_path}")
+
+        try:
+            # Create the yearly folder if it doesn't exist
+            
+            dbutils_instance.fs.mkdirs(reject_output_path)
+            
+            # Save rejected records as CSV
+            df_rejected.write \
+                .format("csv") \
+                .mode("overwrite") \
+                .option("header", "true") \
+                .save(reject_output_path)
+            app_logger.info(f"Successfully saved {rejected_count} rejected records to : {reject_output_path}")
+        except Exception as e:
+            app_logger.error(f"Failed to save rejected records to {reject_output_path  }. Reason: {e}")
+            # Consider raising an exception here if failure to save rejects is critical
+    else:
+        app_logger.info("No records found with null 'customer_id'. All records are valid in this regard.")
+
+    return df_valid # Return only the valid records for further processing
+
+def clean_customer_data(df_customer_transformed: DataFrame) -> DataFrame:
+    """
+    Applies data cleaning and specific transformations for customer data,
+    such as coalescing null string values and handling specific error strings.
+    
+    Args:
+        df_customer_transformed (DataFrame): The DataFrame with standardized columns.
+
+    Returns:
+        DataFrame: The cleaned and transformed DataFrame.
+
+    Raises:
+        Exception: If data cleaning or transformation fails.
+    """
     try:
+        app_logger.info("Applying data cleaning and specific transformations for customers.")
+        
+        # Coalesce all nullable StringType fields to "unknown"
+        # 'customer_id' is non-nullable and handled by rejection, so it's not affected here.
         for field in df_customer_transformed.schema.fields:
             if isinstance(field.dataType, StringType) and field.nullable:
                 df_customer_transformed = df_customer_transformed.withColumn(
@@ -65,58 +178,308 @@ def clean_customer_data(df_customer_transformed):
                     coalesce(col(field.name), lit("unknown"))
                 )
 
+        # Handle specific error strings like "#ERROR!" in phone
         df_customer_cleaned = df_customer_transformed.withColumn(
             "phone",
             when(col("phone") == "#ERROR!", "unknown").otherwise(col("phone"))
         )
+        
         return df_customer_cleaned
     except Exception as e:
+        app_logger.error(f"Failed during data cleaning or transformation. Reason: {e}")
         raise
     
-def load_customer_data(spark, schemaname: str, df):
+def perform_customer_data_quality_checks(df: DataFrame) -> DataFrame:
     """
-    Loads data into raw & processed schema.
-    """
-    try:
-        full_table_name = f"{schemaname}.customers"
-        print(f"Attempting to save data to table: {full_table_name}")
-        df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").partitionBy("file_date").saveAsTable(full_table_name)
-        print(f"Successfully saved data to {full_table_name}")
-        return df
-    except Exception as e:
-        # This is critical for saving operations (permissions, Delta Lake issues, disk space)
-        print(f"ERROR: Failed to save data to table {full_table_name}. Reason: {e}")
-        raise RuntimeError(f"Data saving failed for {full_table_name}: {e}") # Re-raise as a specific error
+    Performs various data quality checks on the customer DataFrame and adds a 'dq_issues' column
+    (ArrayType(StringType())) listing any issues found for each row.
+    
+    Args:
+        df (DataFrame): The DataFrame to perform data quality checks on.
 
-def ingest_customer_pipeline(spark, file_date: str, raw_path: str):
+    Returns:
+        DataFrame: The DataFrame with an added 'dq_issues' column.
     """
-    Orchestrates the full ingestion pipeline.
+    app_logger.info("Performing customer data quality checks...")
+
+    # Initialize dq_issues column as an empty array for all rows
+    df_dq = df.withColumn("dq_issues", array().cast(ArrayType(StringType())))
+
+    # Check 1: Customer ID uniqueness within the current batch
+    # This check is now performed on records that *already* have non-null customer_ids
+    customer_id_counts = df_dq.groupBy("customer_id").agg(count("*").alias("count"))
+    duplicate_customer_ids_df = customer_id_counts.filter(col("count") > 1).select("customer_id")
+    duplicate_ids_list = [row.customer_id for row in duplicate_customer_ids_df.collect()]
+
+    if duplicate_ids_list:
+        app_logger.warning(f"Found duplicate Customer IDs in the current batch: {duplicate_ids_list}")
+        df_dq = df_dq.withColumn("dq_issues",
+                                 when(col("customer_id").isin(duplicate_ids_list),
+                                      array_union(col("dq_issues"), array(lit("CUSTOMER_ID_DUPLICATE_IN_BATCH"))))
+                                 .otherwise(col("dq_issues")))
+    else:
+        app_logger.info("No duplicate Customer IDs found in the current batch.")
+
+    # Check 2: Email format validation (basic regex)
+    email_regex = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+    df_dq = df_dq.withColumn("dq_issues",
+                             when(~col("email").rlike(email_regex), # Removed (col("email") != "unknown")
+                                  array_union(col("dq_issues"), array(lit("EMAIL_INVALID_FORMAT"))))
+                             .otherwise(col("dq_issues")))
+    app_logger.info("Email format validation applied.")
+
+    # Check 3: Phone number format (basic numeric check, removing non-digits)
+    phone_regex = r"^\d{10}$"
+    df_dq = df_dq.withColumn("dq_issues",
+        when(col("phone").isNotNull() & ~col("phone").rlike(phone_regex),
+             array_union(col("dq_issues"), array(lit("PHONE_INVALID_FORMAT"))))
+        .otherwise(col("dq_issues"))
+    )
+
+    # Check 4: Postal Code format (basic numeric check)
+    postal_code_regex = r"^\d{5}$" # This regex expects exactly 5 digits
+    df_dq = df_dq.withColumn("dq_issues",
+        when((col("postal_code").isNotNull()) & (~col("postal_code").rlike(postal_code_regex)), # Removed (col("postal_code") != "unknown")
+             array_union(col("dq_issues"), array(lit("POSTAL_CODE_INVALID_FORMAT"))))
+        .otherwise(col("dq_issues"))
+    )
+    app_logger.info("Postal Code format validation applied.")
+
+    # Check 5: Customer Name not "unknown"
+    df_dq = df_dq.withColumn("dq_issues",
+                             when(col("customer_name") == "unknown",
+                                  array_union(col("dq_issues"), array(lit("CUSTOMER_NAME_IS_UNKNOWN"))))
+                             .otherwise(col("dq_issues")))
+    app_logger.info("Customer Name 'unknown' check applied.")
+
+    # Log summary of data quality issues
+    dq_summary = df_dq.withColumn("has_issues", size(col("dq_issues")) > 0) \
+                     .groupBy("has_issues") \
+                     .count() \
+                     .collect()
+
+    total_rows = df_dq.count()
+    issues_count = 0
+    for row in dq_summary:
+        if row.has_issues:
+            issues_count = row["count"]
+            app_logger.info(f"SUMMARY: {issues_count} out of {total_rows} rows have data quality issues.")
+        else:
+            app_logger.info(f"SUMMARY: {row['count']} rows passed all data quality checks.")
+
+    if issues_count > 0:
+        app_logger.info("Consider reviewing rows with 'dq_issues' column for details on specific issues.")
+
+    return df_dq
+
+
+
+def load_customer_data(spark, schemaname: str, df: DataFrame, file_date: str) -> DataFrame:
+    """
+    Loads a DataFrame into a Delta table in the specified schema.
+    This function now handles SCD Type 2 logic for the 'processed' schema.
+
+    Args:
+        spark: The SparkSession object.
+        schemaname (str): The name of the schema (e.g., "raw", "processed").
+        df (DataFrame): The DataFrame to be saved.
+        file_date (str): The date of the file being processed, used as the effective date.
+
+    Returns:
+        DataFrame: The DataFrame that was saved.
+
+    Raises:
+        RuntimeError: If saving data to the Delta table fails.
+    """
+    full_table_name = f"{schemaname}.customers"
+
+    try:
+        if schemaname == "processed":
+            app_logger.info(f"Applying SCD Type 2 logic for {full_table_name}.")
+
+            # Define the current processing date
+            current_processing_date = to_date(lit(file_date), 'yyyy-MM-dd')
+
+            # Prepare the incoming DataFrame with SCD Type 2 attributes and a change hash
+            # Exclude SCD columns from the hash as they are part of the target table's state
+            hash_columns = [
+                "customer_name", "email", "phone", "address", "segment",
+                "country", "city", "state", "postal_code", "region"
+            ]
+            df_incoming = df.withColumn("effective_start_date", current_processing_date) \
+                                 .withColumn("effective_end_date", lit(None).cast(DateType())) \
+                                 .withColumn("is_current", lit(True).cast(BooleanType())) \
+                                 .withColumn("last_updated_timestamp", current_timestamp()) \
+                                 .withColumn("change_hash", md5(concat_ws("||", *[col(c) for c in hash_columns])))
+
+
+            if not spark.catalog.tableExists(full_table_name):
+                app_logger.info(f"Delta table {full_table_name} does not exist. Creating it with initial load.")
+                
+                # Initial load: add SCD columns and save
+                df_to_write = df_incoming.drop("change_hash") # Use df_incoming which already has SCD columns
+                
+                df_to_write.write.format("delta").mode("overwrite") \
+                                 .partitionBy("effective_start_date") \
+                                 .saveAsTable(full_table_name)
+                
+                app_logger.info(f"Successfully created and loaded initial data to {full_table_name}.")
+                
+                try:
+                    app_logger.info(f"Optimizing and ZORDERing {full_table_name} by customer_id after initial load.")
+                    spark.sql(f"OPTIMIZE {full_table_name} ZORDER BY (customer_id)")
+                    app_logger.info(f"Optimization and ZORDERing completed for {full_table_name}.")
+                except Exception as opt_e:
+                    app_logger.warning(f"Failed to optimize/ZORDER {full_table_name} after initial load. Reason: {opt_e}")
+
+                return df_to_write
+            else:
+                app_logger.info(f"Delta table {full_table_name} exists. Performing merge operation for SCD Type 2.")
+
+                delta_table = DeltaTable.forName(spark, full_table_name)
+
+                # Step 1: Mark old records as not current if changes detected
+                app_logger.info("Step 1: Marking old records as not current (is_current=false) if changes detected.")
+                delta_table.alias("target") \
+                    .merge(
+                        df_incoming.alias("source"),
+                        "target.customer_id = source.customer_id AND target.is_current = true"
+                    ) \
+                    .whenMatchedUpdate(
+                        condition=f"md5(concat_ws('||', " \
+                                  f"target.customer_name, target.email, target.phone, " \
+                                  f"target.address, target.segment, target.country, " \
+                                  f"target.city, target.state, target.postal_code, target.region" \
+                                  f")) != source.change_hash",
+                        set={
+                            "is_current": "false",
+                            "effective_end_date": "date_sub(source.effective_start_date, 1)",
+                            "last_updated_timestamp": "current_timestamp()"
+                        }
+                    ) \
+                    .execute()
+                app_logger.info("Step 1 (update) completed.")
+
+                # Step 2: Insert new records or new versions of changed records
+                # This includes both completely new customer_ids AND the new versions of
+                # customers whose attributes changed in Step 1.
+                app_logger.info("Step 2: Inserting new records or new versions of changed records.")
+                delta_table.alias("target") \
+                    .merge(
+                        df_incoming.alias("source"),
+                        f"target.customer_id=source.customer_id AND "\
+                        f"md5(concat_ws('||', " \
+                        f"target.customer_name, target.email, target.phone, " \
+                        f"target.address, target.segment, target.country, " \
+                        f"target.city, target.state, target.postal_code, target.region" \
+                        f")) = source.change_hash AND target.is_current = true"\
+                        # The join condition here is critical. We only want to insert if
+                        # a record with the same customer_id AND the exact same content (hash)
+                        # and is_current=true does NOT exist. This prevents re-inserting
+                        # identical records.
+                    ) \
+                    .whenNotMatchedInsert(
+                        values={
+                            "customer_id": "source.customer_id",
+                            "customer_name": "source.customer_name",
+                            "email": "source.email",
+                            "phone": "source.phone",
+                            "address": "source.address",
+                            "segment": "source.segment",
+                            "country": "source.country",
+                            "city": "source.city",
+                            "state": "source.state",
+                            "postal_code": "source.postal_code",
+                            "region": "source.region",
+                            "file_date": "source.file_date", # Make sure 'file_date' exists in df_incoming or remove if not needed
+                            "dq_issues": "source.dq_issues", # Make sure 'dq_issues' exists in df_incoming or remove if not needed
+                            "ingestion_timestamp": "source.ingestion_timestamp", # Make sure 'ingestion_timestamp' exists in df_incoming or remove if not needed
+                            "effective_start_date": "source.effective_start_date",
+                            "effective_end_date": "source.effective_end_date",
+                            "is_current": "source.is_current",
+                            "last_updated_timestamp": "source.last_updated_timestamp"
+                        }
+                    ) \
+                    .execute()
+                app_logger.info("Step 2 (insert) completed.")
+
+                app_logger.info(f"SCD Type 2 merge completed for {full_table_name}.")
+
+                # --- OPTIMIZE and ZORDER after merge ---
+                try:
+                    app_logger.info(f"Optimizing and ZORDERing {full_table_name} by customer_id after merge.")
+                    spark.sql(f"OPTIMIZE {full_table_name} ZORDER BY (customer_id)")
+                    app_logger.info(f"Optimization and ZORDERing completed for {full_table_name}.")
+                except Exception as opt_e:
+                    app_logger.warning(f"Failed to optimize/ZORDER {full_table_name} after merge. Reason: {opt_e}")
+
+                return spark.read.format("delta").table(full_table_name)
+
+        else:
+            # Existing logic for other schemas (e.g., "raw")
+            app_logger.info(f"Saving data to {full_table_name} with ov mode.")
+            df.write.format("delta").mode("overwrite").partitionBy("file_date").saveAsTable(full_table_name)
+            app_logger.info(f"Data successfully saved to {full_table_name}.")
+            return df
+
+    except Exception as e:
+        app_logger.error(f"Failed to load data to {full_table_name}. Reason: {e}", exc_info=True)
+        raise RuntimeError(f"Failed to load data to {full_table_name}.") from e
+
+# The main pipeline orchestrator
+def ingest_customer_pipeline(spark, file_date: str, raw_path: str, reject_folder_path: str,dbutils_instance):
+    """
+    Orchestrates the full customer ingestion pipeline:
+    1. Loads raw Excel data.
+    2. Standardizes column names.
+    3. Handles null 'customer_id' records, rejecting invalid records to a specified folder.
+    4. Saves valid records to raw Delta table.
+    5. Cleans and transforms data.
+    6. Performs detailed data quality checks and flags issues.
+    7. Adds ingestion timestamp.
+    8. Saves to processed Delta table using SCD Type 2 logic.
+    
+    Args:
+        spark: The SparkSession object.
+        file_date (str): The date of the file to be ingested (e.g., "2023-01-15").
+        raw_path (str): The base path to the raw data.
+        reject_folder_path (str): The base path where rejected records will be stored.
+
+    Returns:
+        DataFrame: The final processed DataFrame (after SCD Type 2 merge).
+
+    Raises:
+        Exception: If any critical step in the pipeline fails.
     """
     try:
-        print(f"Starting customer ingestion pipeline for file date: {file_date}")
+        app_logger.info(f"Starting customer ingestion pipeline for file date: {file_date}")
 
         # Step 1: Load Raw Data
         df_raw = load_raw_customer_excel(spark, file_date, raw_path, customer_schema)
-        # If load_raw_customer_excel fails, it will raise an exception which is caught by the outer try-except
 
         # Step 2: Standardize Columns
         df_renamed = customer_column_standardize(df_raw, file_date)
 
-        # Step 3: Load to Raw Schema (if this is a separate staging step before final processing)
+        # Step 3: Handle null 'customer_id' records
+        df_valid_ids = handle_customer_id_nulls(spark, df_renamed, reject_folder_path, file_date,dbutils_instance)
 
-        df_raw_final = load_customer_data(spark, "raw", df_renamed) # df_raw_final will be the df returned by load_customer_data
+        # Step 4: Load valid records to Raw Schema
+        load_customer_data(spark, "raw", df_valid_ids, file_date)
 
-        # Step 4: Clean Data
-        df_cleaned = clean_customer_data(df_raw_final)
+        # Step 5: Clean Data
+        df_cleaned = clean_customer_data(df_valid_ids)
 
-        # Step 5: Add Ingestion Date
-        df_final = add_ingestion_date(df_cleaned)
+        # Step 6: Perform Detailed Data Quality Checks
+        df_quality_checked = perform_customer_data_quality_checks(df_cleaned)
 
-        # Step 6: Load to Processed Schema
-        load_customer_data(spark, "processed", df_final)
+        # Step 7: Add Ingestion Timestamp (using the updated function from common.functions)
+        df_final_for_processed = add_ingestion_date(df_quality_checked) # Function name remains add_ingestion_date for pipeline flow
 
-        print(f"Customer ingestion pipeline completed successfully for file date: {file_date}")
-        return df_final # Return the final DataFrame for potential inspection/chaining
+        # Step 8: Load to Processed Schema with SCD Type 2 logic
+        df_processed_output = load_customer_data(spark, "processed", df_final_for_processed, file_date)
+
+        app_logger.info(f"Customer ingestion pipeline completed successfully for file date: {file_date}")
+        return df_processed_output # Return the DataFrame representing the current state of processed table
     except Exception as e:
-        print(f"CRITICAL ERROR: Customer ingestion pipeline failed for file date {file_date}. Reason: {e}")
-        raise # Re-raise the exception to signal pipeline failure
+        app_logger.critical(f"Customer ingestion pipeline failed for file date {file_date}. Reason: {e}", exc_info=True)
+        raise

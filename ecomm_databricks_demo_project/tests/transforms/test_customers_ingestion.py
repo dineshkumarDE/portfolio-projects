@@ -1,194 +1,244 @@
 import pytest
-from datetime import datetime, timedelta 
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.types import StructType, StructField, StringType, LongType, IntegerType, DoubleType, DateType, TimestampType
-from pyspark.sql.functions import lit, col, year, current_timestamp, to_date
+from pyspark.sql import SparkSession,DataFrame
+from pyspark.sql.functions import col, lit, current_timestamp, to_date, md5, concat_ws, date_sub
+from pyspark.sql.types import StructType, StructField, StringType, DateType, ArrayType, BooleanType, TimestampType
+from datetime import date, datetime, timedelta
+from unittest.mock import MagicMock, patch, ANY
 import os
-from unittest.mock import patch, MagicMock, ANY 
-from transform_functions.ingest_customer_data_functions import customer_column_standardize, clean_customer_data, ingest_customer_pipeline, customer_schema, load_customer_data 
 
-from pyspark.sql.functions import col, lit, date_add 
-from common.functions import add_ingestion_date 
+# Assuming your ingestion code is in a module named 'ecomm_ingestion_pipeline'
+# You might need to adjust this import based on your project structure
+from transform_functions.ingest_customer_data_functions import (
+    customer_column_standardize,
+    handle_customer_id_nulls,
+    clean_customer_data,
+    perform_customer_data_quality_checks,
+    load_raw_customer_excel,
+    # customer_schema, # Not directly used in these unit tests, but good to have for understanding
+    # processed_customer_schema # Not directly used in these unit tests
+)
 
-# --- Unit Tests ---
-
-def test_transform_customer_data_renames_columns(spark_session: SparkSession, mock_raw_customer_df):
-    """
-    Tests if columns are correctly renamed and file_date is added.
-    """
-    print("Applying column standardization and adding file_date.") # Print for clarity
-    test_file_date = "2025-05-23"
-    transformed_df = customer_column_standardize(mock_raw_customer_df, test_file_date)
-
-    # Check if expected columns exist and old columns are gone
-    expected_columns = [
-        "customer_id", "customer_name", "email", "phone", "address",
-        "segment", "country", "city", "state", "postal_code", "region", "file_date"
-    ]
-    assert all(col_name in transformed_df.columns for col_name in expected_columns)
-    assert "Customer ID" not in transformed_df.columns # Check old column is gone
-
-    # Check if 'file_date' column has the correct value and type
-    assert transformed_df.filter(col("file_date") == to_date(lit(test_file_date))).count() == transformed_df.count()
-    assert transformed_df.schema["file_date"].dataType == DateType()
-    print("Column standardization and file_date test PASSED.")
-
-
-def test_clean_customer_data_handles_null_customer_name(spark_session: SparkSession, mock_raw_customer_df):
-    """
-    Tests if 'Customer Name' (now customer_name) NULLs are coalesced to 'unknown'.
-    """
-    print("Applying column standardization and adding file_date.") # Print for clarity
-    # First, apply the rename transformation to get 'customer_name'
-    transformed_df = customer_column_standardize(mock_raw_customer_df, "2025-05-23")
-    print("Applying data cleaning for customer_name and phone.") # Print for clarity
-    cleaned_df = clean_customer_data(transformed_df)
-
-    # Check the row where original 'Customer Name' was None
-    # We know C003 had None
-    customer_c003 = cleaned_df.filter(col("customer_id") == "C003").select("customer_name").first()[0]
-    assert customer_c003 == "unknown"
-
-    # Check that non-null names are unchanged
-    customer_c001 = cleaned_df.filter(col("customer_id") == "C001").select("customer_name").first()[0]
-    assert customer_c001 == "Alice Smith"
-    print("Null customer name handling test PASSED.")
-
-
-def test_clean_customer_data_handles_phone_error_string(spark_session: SparkSession, mock_raw_customer_df):
-    """
-    Tests if 'phone' values "#ERROR!" are replaced with 'unknown'.
-    """
-    print("Applying column standardization and adding file_date.") # Print for clarity
-    # First, apply the rename transformation to get 'phone'
-    transformed_df = customer_column_standardize(mock_raw_customer_df, "2025-05-23")
-    print("Applying data cleaning for customer_name and phone.") # Print for clarity
-    cleaned_df = clean_customer_data(transformed_df)
-
-    # Check the row where original 'phone' was "#ERROR!" (C002)
-    customer_c002_phone = cleaned_df.filter(col("customer_id") == "C002").select("phone").first()[0]
-    assert customer_c002_phone == "unknown"
-
-    # Check that other phone numbers are unchanged
-    customer_c001_phone = cleaned_df.filter(col("customer_id") == "C001").select("phone").first()[0]
-    assert customer_c001_phone == "123-456-7890"
-
-    # Check that null phone numbers are unchanged (not handled by this specific coalesce)
-    customer_c004_phone = cleaned_df.filter(col("customer_id") == "C004").select("phone").first()[0]
-    assert customer_c004_phone == "unknown"
-    print("Phone error string handling test PASSED.")
-
-
-def test_add_ingestion_date_adds_column(spark_session: SparkSession, mock_raw_customer_df):
-    """
-    Tests if the add_ingestion_date function correctly adds the column.
-    """
-    print("Applying column standardization and adding file_date.") 
-    transformed_df = customer_column_standardize(mock_raw_customer_df, "2025-05-23")
-    
-    start_time = datetime.now() 
-    final_df = add_ingestion_date(transformed_df)
-    end_time = datetime.now() 
-
-    assert "ingestion_date" in final_df.columns
-    assert final_df.schema["ingestion_date"].dataType == TimestampType()
-    assert final_df.filter(col("ingestion_date").isNotNull()).count() == final_df.count()
-
-    # Get the actual ingestion date from the DataFrame
-    actual_ingestion_date_spark = final_df.select("ingestion_date").first()[0]
-    
-    if isinstance(actual_ingestion_date_spark, datetime):
-        actual_ingestion_date = actual_ingestion_date_spark
-    else:
-       
-        actual_ingestion_date = actual_ingestion_date_spark 
-    assert start_time <= actual_ingestion_date <= end_time + timedelta(seconds=5) 
-    print("add_ingestion_date test PASSED.")
-
-
-# --- End-to-End Pipeline Test (using mocks for external calls) ---
-
-@patch('transform_functions.ingest_customer_data_functions.load_raw_customer_excel') # Mock the external Excel loading
-# Patch add_ingestion_date where it is imported within ingest_customer_data_functions
-# Assuming ingest_customer_pipeline imports add_ingestion_date from common.functions,
-# and ingest_customer_data_functions has `from common.functions import add_ingestion_date`
-@patch('transform_functions.ingest_customer_data_functions.add_ingestion_date') 
-@patch('transform_functions.ingest_customer_data_functions.load_customer_data') 
-def test_ingest_customer_pipeline_success(
-    mock_load_customer_data, 
-    mock_add_ingestion_date, 
-    mock_load_raw_customer_excel, 
-    spark_session,
-    mock_raw_customer_df 
+def test_customer_column_standardize(
+    spark_session: SparkSession,
+    mock_raw_customers_df: DataFrame # This DF now represents the raw, Camel Case input
 ):
     """
-    Tests the full pipeline by mocking external dependencies.
+    Tests customer_column_standardize function to ensure:
+    1. Columns are renamed from Camel Case to snake_case.
+    2. 'file_date' column is correctly added and is of DateType.
     """
-    print(f"Starting customer ingestion pipeline for file date: 2025-05-23")
-    test_file_date = "2025-05-23"
-    test_raw_path = "/mnt/raw_data_test"
+    print("\n--- Testing customer_column_standardize ---")
 
-    # Configure the mock to return our mock DataFrame for raw loading
-    mock_load_raw_customer_excel.return_value = mock_raw_customer_df
+    file_date_str = "2025-05-23"
+    expected_file_date = date.fromisoformat(file_date_str)
+    #expected_file_date = to_date(lit(file_date_str), "yyyy-MM-dd")
+    print(f"Expected file_date: {expected_file_date}")
 
-    # Configure mock_add_ingestion_date to add the column dynamically
-    mock_add_ingestion_date.side_effect = lambda df: df.withColumn("ingestion_date", current_timestamp())
+    # Call the actual function with the raw (Camel Case) DataFrame
+    df_standardized = customer_column_standardize(mock_raw_customers_df, file_date_str)
 
-    mock_load_customer_data.side_effect = lambda spark, schemaname, df: df
-
-
-    result_df = ingest_customer_pipeline(spark_session, test_file_date, test_raw_path)
-
-    # Assert that the mocked load_raw_customer_excel was called with correct arguments
-    mock_load_raw_customer_excel.assert_called_once_with(
-        spark_session, test_file_date, test_raw_path, customer_schema
-    )
-    
-    # Assert that add_ingestion_date was called once
-    mock_add_ingestion_date.assert_called_once() 
-
-    # Assert that load_customer_data was called twice
-    assert mock_load_customer_data.call_count == 2
-    
-    first_call_df_arg = mock_load_customer_data.call_args_list[0].args[2]
-    assert first_call_df_arg.schema.names == customer_column_standardize(mock_raw_customer_df, test_file_date).schema.names
-    assert first_call_df_arg.count() == mock_raw_customer_df.count()
-    mock_load_customer_data.assert_any_call(spark_session, "raw", ANY) 
-
-    second_call_df_arg = mock_load_customer_data.call_args_list[1].args[2]
-    assert second_call_df_arg.schema.names == result_df.schema.names
-    assert second_call_df_arg.count() == result_df.count()
-    assert "ingestion_date" in second_call_df_arg.columns
-    mock_load_customer_data.assert_any_call(spark_session, "processed", ANY) 
-
-    # Assertions on the final DataFrame structure and data
-    expected_final_columns = [
-        "customer_id", "customer_name", "email", "phone", "address",
-        "segment", "country", "city", "state", "postal_code", "region",
-        "file_date", "ingestion_date"
+    # --- Hardcoded list of expected standardized column names ---
+    expected_standardized_columns = [
+        "customer_id",
+        "customer_name",
+        "email",
+        "phone",
+        "address",
+        "segment",    
+        "country",    
+        "city",
+        "state",
+        "postal_code",
+        "region",     
+        "file_date"
     ]
-    assert all(col_name in result_df.columns for col_name in expected_final_columns)
-    assert result_df.count() == mock_raw_customer_df.count() 
 
-    # Verify specific transformations
-    c003_name = result_df.filter(col("customer_id") == "C003").select("customer_name").first()[0]
-    assert c003_name == "unknown"
+    # Assertions
+    # 1. Check if all expected snake_case columns are present and no unexpected columns
+    assert sorted(df_standardized.columns) == sorted(expected_standardized_columns), \
+        f"Standardized columns do not match expected list. Expected: {expected_standardized_columns}, Got: {df_standardized.columns}"
 
-    c002_phone = result_df.filter(col("customer_id") == "C002").select("phone").first()[0]
-    assert c002_phone == "unknown"
+    # 2. Check count of rows (should remain the same)
+    assert df_standardized.count() == 3, "Row count changed after standardization."
 
-    file_date_val = result_df.filter(col("customer_id") == "C001").select("file_date").first()[0]
-    expected_date_obj = datetime.strptime(test_file_date, "%Y-%m-%d").date()
-    assert file_date_val == expected_date_obj
-
-    ingestion_date_val = result_df.filter(col("customer_id") == "C001").select("ingestion_date").first()[0]
-
-  
-    assert isinstance(ingestion_date_val, datetime)
-
-    now = datetime.now()
-
-    assert now - timedelta(seconds=5) <= ingestion_date_val <= now + timedelta(seconds=5)
+    # 3. Check data type of 'file_date' and its value
+    assert "file_date" in df_standardized.columns
+    assert df_standardized.schema["file_date"].dataType == DateType(), \
+        "file_date column should be of DateType."
+    print(df_standardized.show())
+    # Verify a specific row's data and the file_date
+    first_row = df_standardized.filter(col("customer_id") == "C001").collect()[0]
     
-    print("Customer ingestion pipeline completed successfully for file date: 2025-05-23")
-    print("Assertion passed for dynamic timestamp!")
+    assert first_row.customer_name == "Alice"
+    assert str(first_row.postal_code) == "90210" # Check a renamed column's data
+    assert first_row.file_date == expected_file_date, \
+        f"file_date value is incorrect. Expected {expected_file_date}, got {first_row.file_date}"
+
+    print("customer_column_standardize PASSED.")
+
+
+# --- Corrected Test for handle_customer_id_nulls (Option 2 solution) ---
+def test_handle_customer_id_nulls(
+    spark_session: SparkSession,
+    mock_raw_customers_df: DataFrame, # This DF still represents the raw, Camel Case input
+    mock_dbutils: MagicMock,
+    tmp_path
+):
+    """
+    Tests handle_customer_id_nulls function (Option 2: cannot change function signature)
+    to ensure:
+    1. Records with null 'customer_id' are correctly excluded from the returned DataFrame.
+    (Does NOT assert on reject file creation, only provides mocks to allow execution).
+    """
+    print("\n--- Testing handle_customer_id_nulls (Option 2) ---")
+
+    file_date_str = "2025-05-23" 
+    df_standardized_with_nulls = customer_column_standardize(mock_raw_customers_df, file_date_str)
+
+    # Now, pass this standardized DataFrame (which has the null 'customer_id')
+    # directly to the handle_customer_id_nulls function.
+    reject_folder_base_path = str(tmp_path / "rejected_data")
+
+    with patch('pyspark.sql.DataFrame.write') as mock_df_write:
+        mock_df_writer_chained_mock = MagicMock()
+        mock_df_write.return_value = mock_df_writer_chained_mock
+        mock_df_writer_chained_mock.format.return_value = mock_df_writer_chained_mock
+        mock_df_writer_chained_mock.mode.return_value = mock_df_writer_chained_mock
+        mock_df_writer_chained_mock.option.return_value = mock_df_writer_chained_mock
+        mock_df_writer_chained_mock.save.return_value = None
+
+        df_valid = handle_customer_id_nulls(
+            spark_session,
+            df_standardized_with_nulls, # Use the DataFrame that *simulates the pipeline flow*
+            reject_folder_base_path,
+            file_date_str,
+            mock_dbutils
+        )
+
+        assert df_valid.count() == 2, "Expected 2 valid records."
+        assert df_valid.filter(col("customer_id").isNull()).count() == 0, \
+            "Valid DataFrame should not contain any records with null 'customer_id'."
+
+        valid_customer_ids = [row.customer_id for row in df_valid.collect()]
+        assert "C001" in valid_customer_ids
+        assert "C003" in valid_customer_ids
+        assert "Bob" not in [row.customer_name for row in df_valid.collect()], \
+            "The record for 'Bob' (with null customer_id) should not be in the valid DataFrame."
+
+    print("handle_customer_id_nulls PASSED.")
+
+def test_clean_customer_data_nulls_and_error_strings(spark_session: SparkSession):
+    """
+    Tests clean_customer_data function for handling null customer names and phone error strings.
+    """
+    print("\n--- Testing clean_customer_data_nulls_and_error_strings ---")
+    
+    # Define schema for the input DataFrame
+    input_schema = StructType([
+        StructField("customer_id", StringType(), False), # Assuming customer_id is non-nullable after handle_nulls
+        StructField("customer_name", StringType(), True),
+        StructField("email", StringType(), True),
+        StructField("phone", StringType(), True),
+        StructField("file_date", DateType(), False)
+    ])
+
+    df_input_for_cleaning = spark_session.createDataFrame(
+        [
+            ("C001", "Alice", "alice@example.com", "123-456-7890", date(2025, 5, 23)),
+            ("C002", "Bob", "bob@example.com", "#ERROR!", date(2025, 5, 23)), # Error string for phone
+            ("C003", None, "charlie@example.com", "789-012-3456", date(2025, 5, 23)), # Null customer name
+            ("C004", "David", "david@example.com", None, date(2025, 5, 23)) # Null phone
+        ], schema=input_schema
+    )
+
+    cleaned_df = clean_customer_data(df_input_for_cleaning)
+
+    # Assert that the null customer name (for C003) has been coalesced to "unknown"
+    assert cleaned_df.filter(col("customer_id") == "C003").select("customer_name").first()[0] == "unknown"
+    # Assert that the phone number with "#ERROR!" (for C002) has been replaced with "unknown"
+    assert cleaned_df.filter(col("customer_id") == "C002").select("phone").first()[0] == "unknown"
+    # Assert that the null phone for C004 is also 'unknown'
+    assert cleaned_df.filter(col("customer_id") == "C004").select("phone").first()[0] == "unknown"
+    
+    # Ensure valid data remains unchanged
+    assert cleaned_df.filter(col("customer_id") == "C001").select("customer_name").first()[0] == "Alice"
+    assert cleaned_df.filter(col("customer_id") == "C001").select("phone").first()[0] == "123-456-7890"
+
+    print("clean_customer_data_nulls_and_error_strings PASSED.")
+
+
+@pytest.mark.parametrize(
+    "customer_id, email, phone, postal_code, customer_name, expected_issues",
+    [
+        ("C010", "test@example.com", "1234567890", "12345", "Valid Customer", []),
+        ("C001", "another@example.com", "9876543210", "54321", "Another Alice", ["CUSTOMER_ID_DUPLICATE_IN_BATCH"]),
+        ("C011", "invalid-email", "1234567890", "12345", "Invalid Email User", ["EMAIL_INVALID_FORMAT"]),
+        ("C012", "user@.com", "1234567890", "12345", "Invalid Email User 2", ["EMAIL_INVALID_FORMAT"]),
+        ("C013", "test@example.com", "abc", "12345", "Invalid Phone User", ["PHONE_INVALID_FORMAT"]),
+        ("C014", "test@example.com", "", "12345", "Invalid Phone User 2", ["PHONE_INVALID_FORMAT"]),
+        ("C015", "test@example.com", "1234567890", "XYZ", "Invalid Postal User", ["POSTAL_CODE_INVALID_FORMAT"]),
+        ("C016", "test@example.com", "1234567890", "123A4", "Invalid Postal User 2", ["POSTAL_CODE_INVALID_FORMAT"]),
+        ("C017", "test@example.com", "1234567890", "12345", "unknown", ["CUSTOMER_NAME_IS_UNKNOWN"]),
+        ("C018", "bad-email", "bad-phone", "bad-zip", "unknown",
+         ["EMAIL_INVALID_FORMAT", "PHONE_INVALID_FORMAT", "POSTAL_CODE_INVALID_FORMAT", "CUSTOMER_NAME_IS_UNKNOWN"]),
+        # Corrected expected issues for "unknown" values, assuming DQ flags them
+        ("C019", "unknown", "unknown", "unknown", "John Doe",
+         ["EMAIL_INVALID_FORMAT", "PHONE_INVALID_FORMAT", "POSTAL_CODE_INVALID_FORMAT"])
+    ]
+)
+def test_perform_customer_data_quality_checks(spark_session: SparkSession,
+                                               customer_id, email, phone, postal_code, customer_name,
+                                               expected_issues):
+    """
+    Tests various data quality checks using parameterized inputs for the perform_customer_data_quality_checks function.
+    """
+    print(f"\n--- Testing perform_customer_data_quality_checks for customer_id: {customer_id} ---")
+
+    # Schema for the input to DQ checks (after standardization and cleaning)
+    pre_dq_schema = StructType([
+        StructField("customer_id", StringType(), False),
+        StructField("customer_name", StringType(), True),
+        StructField("email", StringType(), True),
+        StructField("phone", StringType(), True),
+        StructField("address", StringType(), True),
+        StructField("segment", StringType(), True),
+        StructField("country", StringType(), True),
+        StructField("city", StringType(), True),
+        StructField("state", StringType(), True),
+        StructField("postal_code", StringType(), True),
+        StructField("region", StringType(), True),
+        StructField("file_date", DateType(), False)
+    ])
+
+    current_test_data = [(
+        customer_id, customer_name, email, phone, "address", "segment", "country", "city", "state", postal_code, "region",
+        date(2025, 5, 23)
+    )]
+
+    # Add a duplicate record if testing for CUSTOMER_ID_DUPLICATE_IN_BATCH
+    if "CUSTOMER_ID_DUPLICATE_IN_BATCH" in expected_issues:
+        current_test_data.append((
+            customer_id, "Duplicate " + customer_name, "dup_" + email, "9999999999", "Dup Address", "Consumer", "USA", "Dup City", "DS", "99999", "Dup Region",
+            date(2025, 5, 23)
+        ))
+
+    df_for_dq = spark_session.createDataFrame(current_test_data, pre_dq_schema)
+    df_with_dq_issues = perform_customer_data_quality_checks(df_for_dq)
+    
+    # Collect all DQ issues for the given customer_id
+    actual_issues_row = df_with_dq_issues.filter(col("customer_id") == customer_id).select("dq_issues").collect()
+
+    actual_issues = []
+    if actual_issues_row and actual_issues_row[0].dq_issues: # Check if dq_issues list is not None and not empty
+        actual_issues.extend(actual_issues_row[0].dq_issues)
+    actual_issues = sorted(list(set(actual_issues))) # Ensure unique and sorted
+
+    expected_issues_sorted = sorted(expected_issues)
+
+    assert actual_issues == expected_issues_sorted, \
+        f"DQ issues for customer_id {customer_id} mismatch.\n" \
+        f"Expected: {expected_issues_sorted}\n" \
+        f"Actual: {actual_issues}"
+
+    print(f"DQ check for customer_id {customer_id} PASSED. Issues: {actual_issues}")
+

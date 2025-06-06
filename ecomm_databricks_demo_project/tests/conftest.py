@@ -7,7 +7,7 @@ from pyspark.sql.types import StructType, StructField, StringType, LongType, Int
 from pyspark.sql.functions import lit, col, year
 import os
 from unittest.mock import patch, MagicMock
-from transform_functions.ingest_customer_data_functions import customer_schema
+from transform_functions.ingest_customer_data_functions import customer_schema as raw_customer_file_schema_definition
 from transform_functions.ingest_orders_data_functions import orders_schema
 from transform_functions.ingest_products_data_functions import products_schema
 # --- Fixture for SparkSession ---
@@ -20,33 +20,36 @@ def spark_session():
     else:
         return SparkSession.builder.appName("PytestInDatabricks").getOrCreate()
 
-@pytest.fixture
-def mock_raw_customer_data():
+
+@pytest.fixture(scope="function")
+def temp_delta_path(tmp_path):
     """
-    Provides mock raw data for customers as a list of tuples (5 records).
-    This data should conform to the customer_schema imported from src.
+    Pytest fixture to create a temporary directory for Delta tables.
+    `tmp_path` is a built-in pytest fixture for creating temporary directories.
     """
-    return [
-        ("C001", "Alice Smith", "alice@example.com", "123-456-7890", "123 Main St", "Consumer", "USA", "New York", "NY", "10001", "East"),
-        ("C002", "Bob Johnson", "bob@example.com", "#ERROR!", "456 Oak Ave", "Corporate", "Canada", "Toronto", "ON", "M5V 2C6", "Central"),
-        ("C003", None, "charlie@example.com", "987-654-3210", "789 Pine Rd", "Home Office", "UK", "London", "England", "SW1A 0AA", "Europe"),
-        ("C004", "Diana Prince", "diana@example.com", None, "101 Lasso Ln", "Consumer", "USA", "Los Angeles", "CA", "90210", "West"),
-        ("C005", "Eve Adams", "eve@example.com", "555-123-4567", "555 Elm St", "Corporate", "Australia", "Sydney", "NSW", "2000", "Oceania"),
-        ("C_MISSING_NAME", None, "missing@example.com", "111-222-3333", "999 Error St", "Consumer", "Germany", "Berlin", "BE", "10115", "Europe"),
-    ]
+    path = tmp_path / "delta_customers"
+    yield str(path)
+    # Cleanup: pytest's tmp_path fixture handles cleanup automatically
+    # if you return path directly. If you explicitly create a sub-dir like this
+    # you might want to ensure it's removed, but tmp_path typically cleans up its root.
+    # For safety, if tmp_path doesn't clean subdirs automatically, you can add:
+    # if os.path.exists(path):
+    #     shutil.rmtree(path)
 
 @pytest.fixture
-def mock_raw_customer_df(spark_session, mock_raw_customer_data):
+def mock_dbutils():
     """
-    Creates a mock Spark DataFrame for customers using the imported customer_schema.
+    Mocks the dbutils object for file system operations.
     """
-    return spark_session.createDataFrame(mock_raw_customer_data, schema=customer_schema)
-
+    mock = MagicMock()
+    # Ensure .fs.mkdirs exists and does nothing
+    mock.fs.mkdirs.return_value = None
+    return mock
 
 @pytest.fixture
 def mock_raw_orders_data():
     """
-    Provides mock raw data for orders as a list of tuples (5 records).
+    Provides mock raw data for orders as a list of tuples (10 records).
     This data should conform to the orders_schema imported from src.
     """
     return [
@@ -65,6 +68,40 @@ def mock_raw_orders_data():
         # ADDED: Record with a null profit for aggregation test (sum should ignore it)
         (10, "O10", date(2025, 4, 1), date(2025, 4, 5), "Standard", "C002", "P002", 1, 10.0, 0.05, None),
     ]
+# --- Customer Schema (Camel Case as used for raw reading) ---
+@pytest.fixture(scope="session")
+def customer_schema():
+    """
+    Provides the raw customer DataFrame schema (Camel Case) as used for initial file reading.
+    This is directly from transform_functions.ingest_customer_data_functions.customer_schema.
+    """
+    return raw_customer_file_schema_definition
+
+# --- Mock Raw Customer Data (Camel Case, matches customer_schema) ---
+@pytest.fixture
+def mock_raw_customers_data():
+    """
+    Provides mock raw customer data with Camel Case column names,
+    conforming to the 'customer_schema' (which is the raw file schema).
+    Includes a record with a null customer_id for testing null handling later.
+    """
+    return [
+        ("C001", "Alice", "alice@example.com", "123-456-7890", "123 Main St", "Premium", "USA", "Anytown", "CA", "90210", "West"),
+        (None, "Bob", "bob@example.com", "098-765-4321", "456 Oak Ave", "Basic", "Canada", "Otherville", "ON", "M1A1A1", "East"), # Null customer_id
+        ("C003", "Charlie", "charlie@example.com", "111-222-3333", "789 Pine Ln", "Gold", "Mexico", "Somewhere", "MX", "01000", "South"),
+    ]
+
+
+
+# --- Mock Raw Customer DataFrame (Camel Case, derived from mock_raw_customers_data and customer_schema) ---
+@pytest.fixture
+def mock_raw_customers_df(spark_session, mock_raw_customers_data, customer_schema):
+    """
+    Creates a mock Spark DataFrame for raw customers with Camel Case columns,
+    using the 'customer_schema' (raw file schema).
+    """
+    return spark_session.createDataFrame(mock_raw_customers_data, schema=customer_schema)
+
 
 @pytest.fixture
 def mock_raw_orders_df(spark_session, mock_raw_orders_data):
@@ -86,7 +123,6 @@ def mock_raw_products_data():
         ("P003", "Furniture", "Chairs", "Executive Chair", "Texas", 350.00),
         ("P004", "Technology", "Laptops", "Gaming Laptop", "Florida", 1500.00),
         ("P005", "Books", "Fiction", "Sci-Fi Novel", "Washington", 15.00),
-           # ADDED: Record with a null sub_category for aggregation test (should group correctly)
         ("P_NO_CATEGORY", "Misc", None, "Misc Item", "Unknown", 5.00),
     ]
 
@@ -97,12 +133,15 @@ def mock_raw_products_df(spark_session, mock_raw_products_data):
     """
     return spark_session.createDataFrame(mock_raw_products_data, schema=products_schema)
 
+
 @pytest.fixture
-def mock_add_ingestion_date_func(): # Renamed to clearly indicate it's a function mock
+def mock_add_ingestion_date_func():
     """
-    Provides a MagicMock callable that simulates the add_ingestion_date function.
+    Provides a MagicMock callable that simulates the add_ingestion_date function
+    by adding an 'ingestion_timestamp' column with current timestamp.
     """
     mock_func = MagicMock()
-    mock_func.side_effect = lambda df: df.withColumn("ingestion_date", lit("2025-05-23T10:00:00Z").cast("timestamp"))
+    # The side_effect makes the mock behave like a function that takes a DataFrame
+    # and returns it with the 'ingestion_timestamp' column added.
+    mock_func.side_effect = lambda df: df.withColumn("ingestion_timestamp", current_timestamp())
     return mock_func
-

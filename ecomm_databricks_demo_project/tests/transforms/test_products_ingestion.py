@@ -1,197 +1,241 @@
 import pytest
-from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType, TimestampType, DateType
-from pyspark.sql.functions import lit, col, current_timestamp, to_date
-from unittest.mock import patch, MagicMock
-from datetime import datetime 
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.functions import col, lit, current_timestamp, to_date, md5, concat_ws, date_sub
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, DateType, ArrayType, BooleanType, TimestampType
+from datetime import date, datetime, timedelta
+from unittest.mock import MagicMock, patch, ANY
+import os
 
+# Assuming your ingestion code is in a module named 'transform_functions.ingest_products_data_functions'
 from transform_functions.ingest_products_data_functions import (
-    load_raw_products_csv,
     standardize_products_columns,
+    handle_product_id_nulls,
     clean_and_transform_products_data,
-    load_products_data,
-    ingest_products_pipeline,
-    products_schema # Import the schema
+    perform_product_data_quality_checks,
+    load_raw_products_csv,
+    products_schema # Importing for schema definition if needed in tests
 )
 
-from common.configurations import raw_folder_path
-
-
-# --- Unit Tests ---
-
-def test_load_raw_products_csv_success(spark_session: SparkSession, mock_raw_products_df: DataFrame):
+def test_standardize_products_columns(
+    spark_session: SparkSession,
+    mock_raw_products_df: DataFrame # This DF now represents the raw, Camel Case input
+):
     """
-    Tests that load_raw_products_csv correctly attempts to read a CSV file
-    and returns a DataFrame matching the expected schema and count.
+    Tests standardize_products_columns function to ensure:
+    1. Columns are renamed from Camel Case to snake_case.
+    2. 'file_date' column is correctly added and is of DateType.
     """
-    test_file_date = "2025-05-23"
-    expected_load_path = f"{raw_folder_path}/{test_file_date}/Products.csv"
+    print("\n--- Testing standardize_products_columns ---")
 
-    with patch('pyspark.sql.SparkSession.read') as mock_spark_read:
-        mock_format_return = MagicMock()
-        mock_option_return = MagicMock()
-        mock_schema_return = MagicMock()
+    file_date_str = "2025-05-23"
+    expected_file_date = date.fromisoformat(file_date_str)
+    print(f"Expected file_date: {expected_file_date}")
 
-        mock_spark_read.format.return_value = mock_format_return
-        mock_format_return.option.return_value = mock_option_return
-        mock_option_return.schema.return_value = mock_schema_return
-        mock_schema_return.load.return_value = mock_raw_products_df
+    # Call the actual function with the raw (Camel Case) DataFrame
+    df_standardized = standardize_products_columns(mock_raw_products_df, file_date_str)
 
-        df = load_raw_products_csv(spark_session, test_file_date, raw_folder_path, products_schema)
-
-        mock_spark_read.format.assert_called_once_with("csv")
-        mock_format_return.option.assert_called_once_with("header", "true")
-        mock_option_return.schema.assert_called_once_with(products_schema)
-        mock_schema_return.load.assert_called_once_with(expected_load_path)
-
-        assert df is mock_raw_products_df
-        assert df.count() == mock_raw_products_df.count()
-        assert df.count() == 6
-        assert df.schema == products_schema
-
-
-def test_standardize_products_columns(spark_session: SparkSession, mock_raw_products_df: DataFrame):
-    """
-    Tests if raw product columns are correctly renamed and a file_date column is added.
-    """
-    test_file_date = "2025-05-23"
-    df_renamed = standardize_products_columns(mock_raw_products_df, test_file_date)
-
-    expected_cols = ["product_id", "category", "sub_category", "product_name", "state", "price_per_product", "file_date"]
-
-    assert all(col_name in df_renamed.columns for col_name in expected_cols)
-    assert "Product ID" not in df_renamed.columns
-
-    product_name_val = df_renamed.filter(col("product_id") == "P001").select("product_name").collect()[0][0]
-    assert product_name_val == "Smartphone X"
-
-    price_val = df_renamed.filter(col("product_id") == "P002").select("price_per_product").collect()[0][0]
-    assert price_val == 25.50
-
-    assert df_renamed.filter(col("file_date") == to_date(lit(test_file_date))).count() == df_renamed.count()
-    assert df_renamed.schema["file_date"].dataType == DateType()
-
-
-def test_clean_and_transform_products_data_fillna_price(spark_session: SparkSession):
-    """
-    Tests if 'price_per_product' NULL values are filled with 0.0.
-    This test creates its own input DataFrame with standardized column names
-    to isolate the cleaning/fillna logic.
-    """
-    data = [
-        ("P1", "CatA", 10.0),
-        ("P2", "CatB", None),
-        ("P3", "CatC", 5.0)
+    # Hardcoded list of expected standardized column names
+    expected_standardized_columns = [
+        "product_id",
+        "category",
+        "sub_category",
+        "product_name",
+        "state",
+        "price_per_product",
+        "file_date"
     ]
-    input_schema_for_cleaning = StructType([
+
+    # Assertions
+    # 1. Check if all expected snake_case columns are present and no unexpected columns
+    assert sorted(df_standardized.columns) == sorted(expected_standardized_columns), \
+        f"Standardized columns do not match expected list. Expected: {expected_standardized_columns}, Got: {df_standardized.columns}"
+
+    # 2. Check count of rows (should remain the same)
+    assert df_standardized.count() == 6, "Row count changed after standardization."
+
+    # 3. Check data type of 'file_date' and its value
+    assert "file_date" in df_standardized.columns
+    assert df_standardized.schema["file_date"].dataType == DateType(), \
+        "file_date column should be of DateType."
+    
+    # Verify a specific row's data and the file_date
+    first_row = df_standardized.filter(col("product_id") == "P001").collect()[0]
+    assert first_row.product_name == "Smartphone X"
+    assert first_row.price_per_product == 999.99
+    assert first_row.file_date == expected_file_date, \
+        f"file_date value is incorrect. Expected {expected_file_date}, got {first_row.file_date}"
+
+    print("standardize_products_columns PASSED.")
+
+
+def test_handle_product_id_nulls(
+    spark_session: SparkSession,
+    mock_dbutils: MagicMock,
+    tmp_path
+):
+    """
+    Tests handle_product_id_nulls function to ensure:
+    1. Records with null 'product_id' are correctly excluded from the returned DataFrame.
+    2. Mocking `dbutils` and `DataFrame.write` to prevent actual file system operations.
+    """
+    print("\n--- Testing handle_product_id_nulls ---")
+
+    file_date_str = "2025-05-23"
+    
+    # Create a DataFrame with a null product_id for testing
+    input_schema = StructType([
+        StructField("product_id", StringType(), True), # Nullable for this test input
+        StructField("category", StringType(), True),
+        StructField("sub_category", StringType(), True),
+        StructField("product_name", StringType(), True),
+        StructField("state", StringType(), True),
+        StructField("price_per_product", DoubleType(), True),
+        StructField("file_date", DateType(), False)
+    ])
+
+    df_with_nulls = spark_session.createDataFrame(
+        [
+            ("P001", "Electronics", "Phones", "Smartphone X", "California", 999.99, date(2025, 5, 23)),
+            (None, "Office Supplies", "Paper", "Printer Paper", "New York", 25.50, date(2025, 5, 23)), # Null product_id
+            ("P003", "Furniture", "Chairs", "Executive Chair", "Texas", 350.00, date(2025, 5, 23)),
+        ], schema=input_schema
+    )
+
+    reject_folder_base_path = str(tmp_path / "rejected_products_data")
+
+    with patch('pyspark.sql.DataFrame.write') as mock_df_write:
+        mock_df_writer_chained_mock = MagicMock()
+        mock_df_write.return_value = mock_df_writer_chained_mock
+        mock_df_writer_chained_mock.format.return_value = mock_df_writer_chained_mock
+        mock_df_writer_chained_mock.mode.return_value = mock_df_writer_chained_mock
+        mock_df_writer_chained_mock.option.return_value = mock_df_writer_chained_mock
+        mock_df_writer_chained_mock.save.return_value = None
+
+        df_valid = handle_product_id_nulls(
+            spark_session,
+            df_with_nulls,
+            reject_folder_base_path,
+            file_date_str,
+            mock_dbutils
+        )
+
+        assert df_valid.count() == 2, "Expected 2 valid records after handling null product_ids."
+        assert df_valid.filter(col("product_id").isNull()).count() == 0, \
+            "Valid DataFrame should not contain any records with null 'product_id'."
+
+        valid_product_ids = [row.product_id for row in df_valid.collect()]
+        assert "P001" in valid_product_ids
+        assert "P003" in valid_product_ids
+        assert "Printer Paper" not in [row.product_name for row in df_valid.collect()], \
+            "The record for 'Printer Paper' (with null product_id) should not be in the valid DataFrame."
+
+    print("handle_product_id_nulls PASSED.")
+
+
+def test_clean_and_transform_products_data_nulls(spark_session: SparkSession):
+    """
+    Tests clean_and_transform_products_data function for handling null values
+    in string columns and price_per_product.
+    """
+    print("\n--- Testing clean_and_transform_products_data_nulls ---")
+    
+    # Define schema for the input DataFrame (after standardization and null ID handling)
+    input_schema = StructType([
         StructField("product_id", StringType(), False),
         StructField("category", StringType(), True),
-        StructField("price_per_product", DoubleType(), True)
+        StructField("sub_category", StringType(), True),
+        StructField("product_name", StringType(), True),
+        StructField("state", StringType(), True),
+        StructField("price_per_product", DoubleType(), True),
+        StructField("file_date", DateType(), False)
     ])
-    df_input_for_cleaning = spark_session.createDataFrame(data, schema=input_schema_for_cleaning)
 
-    df_cleaned = clean_and_transform_products_data(df_input_for_cleaning)
-
-    assert df_cleaned.filter(col("product_id") == "P2").select("price_per_product").collect()[0][0] == 0.0
-    assert df_cleaned.filter(col("product_id") == "P1").select("price_per_product").collect()[0][0] == 10.0
-    assert df_cleaned.filter(col("product_id") == "P3").select("price_per_product").collect()[0][0] == 5.0
-
-
-def test_load_products_data_saves_to_delta(spark_session: SparkSession):
-    """
-    Tests if the load_products_data function (with its original signature)
-    attempts to save to a Delta table with the correct chain of calls,
-    including .partitionBy("file_date").
-    """
-    target_schema_name = "test_target_schema"
-    expected_partition_column = "file_date" # The column expected to be used for partitioning
-
-    mock_df_to_save = MagicMock(spec=DataFrame)
-
-    # Explicitly create mocks for the chain of calls
-    mock_df_write = MagicMock()
-    mock_df_to_save.write = mock_df_write # df.write
-
-    mock_format_chain = MagicMock()    # .format() returns this
-    mock_mode_chain = MagicMock()      # .mode() returns this
-    mock_option_chain = MagicMock()    # .option() returns this
-    mock_partition_chain = MagicMock() # .partitionBy() returns this 
-
-    # Wire up the chain of return values to simulate the call sequence
-    mock_df_write.format.return_value = mock_format_chain
-    mock_format_chain.mode.return_value = mock_mode_chain
-    mock_mode_chain.option.return_value = mock_option_chain
-    mock_option_chain.partitionBy.return_value = mock_partition_chain
-    mock_partition_chain.saveAsTable.return_value = None 
-
-    load_products_data(spark_session, target_schema_name, mock_df_to_save)
-
-    mock_df_write.format.assert_called_once_with("delta")
-    mock_format_chain.mode.assert_called_once_with("overwrite")
-    mock_mode_chain.option.assert_called_once_with("overwriteSchema", "true")
-
-    mock_option_chain.partitionBy.assert_called_once_with(expected_partition_column)
-
-    mock_partition_chain.saveAsTable.assert_called_once_with(f"{target_schema_name}.products")
-
-    print("\nTest passed: load_products_data saving chain (with internal partitioning) verified correctly!")
-
-
-@patch('transform_functions.ingest_products_data_functions.load_products_data')
-@patch('transform_functions.ingest_products_data_functions.clean_and_transform_products_data')
-@patch('transform_functions.ingest_products_data_functions.standardize_products_columns')
-@patch('transform_functions.ingest_products_data_functions.load_raw_products_csv')
-# Patch add_ingestion_date at its import location within ingest_products_data_functions.py
-@patch('transform_functions.ingest_products_data_functions.add_ingestion_date')
-def test_ingest_products_pipeline_orchestration(
-    mock_add_ingestion_date,
-    mock_load_raw_products_csv,
-    mock_standardize_products_columns,
-    mock_clean_and_transform_products_data,
-    mock_load_products_data,
-    spark_session: SparkSession,
-    mock_raw_products_df: DataFrame
-):
-    test_file_date = "2025-05-23"
-    test_raw_path = "/mnt/landing"
-
-    # Define DF representing output of standardize/clean *before* ingestion_date
-    dummy_transformed_df_before_ingestion = spark_session.createDataFrame(
-        [("P001_processed", "Electronics", "Phones", 999.99, "2025-05-23")],
-        ["product_id", "category", "sub_category", "price_per_product", "file_date"]
-    ).withColumn("file_date", to_date(col("file_date")))
-
-    # Configure mock return values
-    mock_load_raw_products_csv.return_value = mock_raw_products_df
-    # standardize_products_columns will return the dummy_transformed_df_before_ingestion
-    mock_standardize_products_columns.return_value = dummy_transformed_df_before_ingestion
-    mock_clean_and_transform_products_data.return_value = dummy_transformed_df_before_ingestion
-
-    # Configure add_ingestion_date to actually add the column with a dynamic timestamp
-    mock_add_ingestion_date.side_effect = lambda df: df.withColumn("ingestion_date", current_timestamp())
-
-    mock_load_products_data.return_value = None
-
-    # Execute the pipeline
-    result_df = ingest_products_pipeline(
-        spark=spark_session,
-        file_date=test_file_date,
-        raw_folder_path=test_raw_path
+    df_input_for_cleaning = spark_session.createDataFrame(
+        [
+            ("P001", "Electronics", "Phones", "Smartphone X", "California", 999.99, date(2025, 5, 23)),
+            ("P002", None, "Paper", "Printer Paper", "New York", 25.50, date(2025, 5, 23)), # Null category
+            ("P003", "Furniture", None, "Executive Chair", "Texas", 350.00, date(2025, 5, 23)), # Null sub_category
+            ("P004", "Technology", "Laptops", None, "Florida", 1500.00, date(2025, 5, 23)), # Null product_name
+            ("P005", "Books", "Fiction", "Sci-Fi Novel", None, 15.00, date(2025, 5, 23)), # Null state
+            ("P006", "Misc", "Other", "Unknown Item", "Unknown", None, date(2025, 5, 23)) # Null price_per_product
+        ], schema=input_schema
     )
 
-    # --- Assertions ---
-    mock_load_raw_products_csv.assert_called_once_with(
-        spark_session, test_file_date, test_raw_path, products_schema
-    )
-    mock_standardize_products_columns.assert_called_once_with(mock_raw_products_df, test_file_date)
-    mock_clean_and_transform_products_data.assert_called_once_with(dummy_transformed_df_before_ingestion)
-    mock_add_ingestion_date.assert_called_once_with(dummy_transformed_df_before_ingestion)
+    cleaned_df = clean_and_transform_products_data(df_input_for_cleaning)
 
-    assert mock_load_products_data.call_count == 2
+    # Assertions for coalesced values
+    assert cleaned_df.filter(col("product_id") == "P002").select("category").first()[0] == "unknown"
+    assert cleaned_df.filter(col("product_id") == "P003").select("sub_category").first()[0] == "unknown"
+    assert cleaned_df.filter(col("product_id") == "P004").select("product_name").first()[0] == "unknown"
+    assert cleaned_df.filter(col("product_id") == "P005").select("state").first()[0] == "unknown"
+    assert cleaned_df.filter(col("product_id") == "P006").select("price_per_product").first()[0] == 0.0
 
-    mock_load_products_data.assert_any_call(spark_session, "raw", mock_standardize_products_columns.return_value)
-    mock_load_products_data.assert_any_call(spark_session, "processed", result_df)
+    # Ensure valid data remains unchanged
+    assert cleaned_df.filter(col("product_id") == "P001").select("product_name").first()[0] == "Smartphone X"
+    assert cleaned_df.filter(col("product_id") == "P001").select("price_per_product").first()[0] == 999.99
 
-    assert "ingestion_date" in result_df.columns
-    assert result_df.schema["ingestion_date"].dataType == TimestampType()
-    assert result_df.count() == dummy_transformed_df_before_ingestion.count()
+    print("clean_and_transform_products_data_nulls PASSED.")
+
+
+@pytest.mark.parametrize(
+    "product_id, category, sub_category, product_name, state, price_per_product, expected_issues",
+    [
+        ("P010", "Electronics", "Phones", "Valid Product", "California", 100.0, []),
+        ("P001", "Electronics", "Phones", "Duplicate Product", "California", 100.0, ["PRODUCT_ID_DUPLICATE_IN_BATCH"]),
+        ("P011", "Books", "Fiction", "Negative Price Book", "New York", -5.0, ["PRICE_PER_PRODUCT_NEGATIVE"]),
+        ("P012", "Office Supplies", "Paper", "unknown", "Texas", 10.0, ["PRODUCT_NAME_IS_UNKNOWN"]),
+        ("P013", "Electronics", "Gadgets", "Combined Issues", "Florida", -10.0, ["PRICE_PER_PRODUCT_NEGATIVE"]),
+        ("P014", "Electronics", "Gadgets", "unknown", "Florida", -10.0, ["PRICE_PER_PRODUCT_NEGATIVE", "PRODUCT_NAME_IS_UNKNOWN"])
+    ]
+)
+def test_perform_product_data_quality_checks(spark_session: SparkSession,
+                                             product_id, category, sub_category, product_name, state, price_per_product,
+                                             expected_issues):
+    """
+    Tests various data quality checks using parameterized inputs for the perform_product_data_quality_checks function.
+    """
+    print(f"\n--- Testing perform_product_data_quality_checks for product_id: {product_id} ---")
+
+    # Schema for the input to DQ checks (after standardization and cleaning)
+    pre_dq_schema = StructType([
+        StructField("product_id", StringType(), False),
+        StructField("category", StringType(), True),
+        StructField("sub_category", StringType(), True),
+        StructField("product_name", StringType(), True),
+        StructField("state", StringType(), True),
+        StructField("price_per_product", DoubleType(), True),
+        StructField("file_date", DateType(), False)
+    ])
+
+    current_test_data = [(
+        product_id, category, sub_category, product_name, state, price_per_product,
+        date(2025, 5, 23)
+    )]
+
+    # Add a duplicate record if testing for PRODUCT_ID_DUPLICATE_IN_BATCH
+    if "PRODUCT_ID_DUPLICATE_IN_BATCH" in expected_issues:
+        current_test_data.append((
+            product_id, "Duplicate Category", "Duplicate Sub", "Duplicate Product", "Duplicate State", 99.99,
+            date(2025, 5, 23)
+        ))
+
+    df_for_dq = spark_session.createDataFrame(current_test_data, pre_dq_schema)
+    df_with_dq_issues = perform_product_data_quality_checks(df_for_dq)
+    
+    # Collect all DQ issues for the given product_id
+    actual_issues_row = df_with_dq_issues.filter(col("product_id") == product_id).select("dq_issues").collect()
+
+    actual_issues = []
+    if actual_issues_row and actual_issues_row[0].dq_issues: # Check if dq_issues list is not None and not empty
+        actual_issues.extend(actual_issues_row[0].dq_issues)
+    actual_issues = sorted(list(set(actual_issues))) # Ensure unique and sorted
+
+    expected_issues_sorted = sorted(expected_issues)
+
+    assert actual_issues == expected_issues_sorted, \
+        f"DQ issues for product_id {product_id} mismatch.\n" \
+        f"Expected: {expected_issues_sorted}\n" \
+        f"Actual: {actual_issues}"
+
+    print(f"DQ check for product_id {product_id} PASSED. Issues: {actual_issues}")
+

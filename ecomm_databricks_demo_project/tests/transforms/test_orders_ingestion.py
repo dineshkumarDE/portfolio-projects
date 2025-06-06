@@ -1,125 +1,177 @@
 import pytest
-from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, DateType, TimestampType
-from pyspark.sql.functions import lit, col, current_timestamp, round, to_date 
-from unittest.mock import patch, MagicMock
-from datetime import datetime,date 
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.functions import col, lit, current_timestamp, to_date, md5, concat_ws, date_sub, array, array_union, size, round
+from pyspark.sql.types import StructType, StructField, StringType, DateType, ArrayType, BooleanType, TimestampType, IntegerType, DoubleType
+from datetime import date, datetime, timedelta
+from unittest.mock import MagicMock, patch, ANY
+import os
 
+# Assuming your ingestion code is in a module named 'ecomm_ingestion_pipeline'
+# You might need to adjust this import based on your project structure
 from transform_functions.ingest_orders_data_functions import (
-    load_raw_orders_json,
     standardize_orders_columns,
-    clean_and_transform_orders_data, 
-    load_orders_data,
-    ingest_orders_pipeline,
-    orders_schema 
+    handle_critical_id_nulls,
+    clean_and_transform_orders_data,
+    perform_order_data_quality_checks,
+    load_raw_orders_json,
+    orders_schema, # Import the schema for creating test DataFrames
+    processed_orders_schema # Not directly used in these unit tests
 )
-from common.configurations import raw_folder_path 
-
-# --- Unit Tests ---
-
-def test_load_raw_orders_json_success(spark_session: SparkSession, mock_raw_orders_df: DataFrame):
-    """
-    Tests that load_raw_orders_json attempts to read from the correct path
-    and returns a DataFrame matching the expected schema and count.
-    """
-    test_file_date = "2025-05-23"
-    expected_load_path = f"{raw_folder_path}/{test_file_date}/Orders.json"
-
-    with patch('pyspark.sql.SparkSession.read') as mock_spark_read:
-        mock_format_return = MagicMock()
-        mock_schema_return = MagicMock()
-        mock_option_1_return = MagicMock()
-        mock_option_2_return = MagicMock()
-
-        mock_spark_read.format.return_value = mock_format_return
-        mock_format_return.schema.return_value = mock_schema_return
-        mock_schema_return.option.return_value = mock_option_1_return
-        mock_option_1_return.option.return_value = mock_option_2_return
-        mock_option_2_return.load.return_value = mock_raw_orders_df
-
-        df = load_raw_orders_json(spark_session, test_file_date, raw_folder_path, orders_schema)
-
-        mock_spark_read.format.assert_called_once_with("json")
-        mock_format_return.schema.assert_called_once_with(orders_schema)
-        mock_schema_return.option.assert_called_once_with("dateFormat", "d/M/yyyy")
-        mock_option_1_return.option.assert_called_once_with("multiLine", "true")
-        mock_option_2_return.load.assert_called_once_with(expected_load_path)
-
-        assert df is mock_raw_orders_df
-        assert df.count() == mock_raw_orders_df.count()
-        assert df.count() == 10
-        assert df.schema == orders_schema
 
 
-def test_standardize_orders_columns(spark_session: SparkSession, mock_raw_orders_df: DataFrame):
-    """
-    Tests if raw orders columns are correctly renamed and a file_date column is added as DateType.
-    """
-    test_file_date = "2025-05-23"
-    df_renamed = standardize_orders_columns(mock_raw_orders_df, test_file_date)
-    # Convert file_date to DateType for test to match main function logic
-    df_renamed = df_renamed.withColumn("file_date", to_date(col("file_date"), "yyyy-MM-dd"))
-
-    expected_cols = ["row_id", "order_id", "order_date", "ship_date", "ship_mode",
-                     "customer_id", "product_id", "quantity", "price", "discount",
-                     "profit", "file_date"]
-
-    assert all(col_name in df_renamed.columns for col_name in expected_cols)
-    assert "Row ID" not in df_renamed.columns
-
-    assert df_renamed.filter(col("file_date") == date.fromisoformat(test_file_date)).count() == df_renamed.count()
-    assert isinstance(df_renamed.schema["file_date"].dataType, DateType)
-
-    price_value = df_renamed.filter(col("order_id") == "O1").select("price").collect()[0][0]
-    assert price_value == 100.0
-
-
-# Fix the parameterized test for profit rounding and null handling
-@pytest.mark.parametrize(
-    "input_profit, expected_profit",
-    [
-        (123.456, 123.46),
-        (789.012, 789.01),
-        (50.000, 50.00),
-        (7.89, 7.89),
-        (12.3, 12.30),
-        (0.005, 0.01),
-        (0.004, 0.00),
-        (None, 0.0) 
-    ]
-)
-def test_clean_and_transform_orders_data_profit_rounding_parametrized(
+def test_standardize_orders_columns(
     spark_session: SparkSession,
-    input_profit: float,
-    expected_profit: float
+    mock_raw_orders_df: DataFrame # This DF now represents the raw, Camel Case input
 ):
     """
-    Tests if profit values are correctly rounded to 2 decimal places and
-    null profits are handled, using parametrization.
-    Each test case creates a minimal DataFrame *with all expected columns*
-    to isolate the profit logic.
+    Tests standardize_orders_columns function to ensure:
+    1. Columns are renamed from Camel Case to snake_case.
+    2. 'file_date' column is correctly added and is of DateType.
     """
-    
-    raw_data = [
-        (
-            1,                # Row ID
-            "dummy_order_id", # Order ID
-            "2024-01-01",     # Order Date (as string, matching how you load raw data then standardize)
-            "2024-01-05",     # Ship Date
-            "Standard Class", # Ship Mode
-            "C_dummy",        # Customer ID
-            "P_dummy",        # Product ID
-            1,                # Quantity
-            10.0,             # Price
-            0.0,              # Discount
-            input_profit      # Profit (this is the one we're testing)
-        )
+    print("\n--- Testing standardize_orders_columns ---")
+
+    file_date_str = "2025-05-23"
+    expected_file_date = date.fromisoformat(file_date_str)
+    print(f"Expected file_date: {expected_file_date}")
+
+    # Call the actual function with the raw (Camel Case) DataFrame
+    df_standardized = standardize_orders_columns(mock_raw_orders_df, file_date_str)
+
+    # --- Hardcoded list of expected standardized column names ---
+    expected_standardized_columns = [
+        "row_id",
+        "order_id",
+        "order_date",
+        "ship_date",
+        "ship_mode",
+        "customer_id",
+        "product_id",
+        "quantity",
+        "price",
+        "discount",
+        "profit",
+        "file_date"
     ]
 
-    input_schema_for_cleaning = StructType([
+    # Assertions
+    # 1. Check if all expected snake_case columns are present and no unexpected columns
+    assert sorted(df_standardized.columns) == sorted(expected_standardized_columns), \
+        f"Standardized columns do not match expected list. Expected: {expected_standardized_columns}, Got: {df_standardized.columns}"
+
+    # 2. Check count of rows (should remain the same)
+    assert df_standardized.count() == mock_raw_orders_df.count(), "Row count changed after standardization."
+
+    # 3. Check data type of 'file_date' and its value
+    assert "file_date" in df_standardized.columns
+    assert df_standardized.schema["file_date"].dataType == DateType(), \
+        "file_date column should be of DateType."
+    
+    # Verify a specific row's data and the file_date
+    first_row = df_standardized.filter(col("order_id") == "O1").collect()[0]
+    
+    assert first_row.customer_id == "C1"
+    assert first_row.quantity == 10 # Check a renamed column's data
+    assert first_row.file_date == expected_file_date, \
+        f"file_date value is incorrect. Expected {expected_file_date}, got {first_row.file_date}"
+
+    print("standardize_orders_columns PASSED.")
+
+
+def test_handle_critical_id_nulls(
+    spark_session: SparkSession,
+    mock_dbutils: MagicMock,
+    tmp_path
+):
+    """
+    Tests handle_critical_id_nulls function to ensure:
+    1. Records with null 'row_id', 'order_id', 'customer_id', or 'product_id' are rejected.
+    2. Valid records are returned.
+    3. Mocks the file system write operation for rejected records.
+    """
+    print("\n--- Testing handle_critical_id_nulls ---")
+
+    file_date_str = "2025-05-23" 
+    
+    # Define a local schema for this test to allow nulls in critical ID columns
+    # This allows us to directly test the null handling logic by injecting nulls.
+    # NOTE: For this test to be truly effective, the 'orders_schema' in
+    # 'ingest_orders_data_functions.py' should define 'Row ID', 'Order ID',
+    # 'Customer ID', and 'Product ID' as nullable (True). Otherwise, the
+    # load_raw_orders_json function would fail on schema enforcement before
+    # handle_critical_id_nulls is called in a real pipeline run.
+    test_input_schema_for_null_handling = StructType([
+        StructField("row_id", IntegerType(), True), # Allow null for testing
+        StructField("order_id", StringType(), True), # Allow null for testing
+        StructField("order_date", DateType(), True),
+        StructField("ship_date", DateType(), True),
+        StructField("ship_mode", StringType(), True),
+        StructField("customer_id", StringType(), True), # Allow null for testing
+        StructField("product_id", StringType(), True), # Allow null for testing
+        StructField("quantity", IntegerType(), True),
+        StructField("price", DoubleType(), True),
+        StructField("discount", DoubleType(), True),
+        StructField("profit", DoubleType(), True),
+        StructField("file_date", DateType(), False) # file_date is added by standardize_orders_columns
+    ])
+
+    # Create a DataFrame with nulls in critical ID columns for testing
+    input_data_with_nulls = [
+        (1, "O1", date(2025, 1, 1), date(2025, 1, 5), "Standard", "C1", "P1", 10, 100.0, 0.1, 10.0, date(2025, 5, 23)),
+        (None, "O2", date(2025, 1, 2), date(2025, 1, 6), "Fast", "C2", "P2", 5, 50.0, 0.05, 5.0, date(2025, 5, 23)), # Null row_id
+        (3, None, date(2025, 1, 3), date(2025, 1, 7), "Same Day", "C3", "P3", 2, 20.0, 0.0, 2.0, date(2025, 5, 23)), # Null order_id
+        (4, "O4", date(2025, 1, 4), date(2025, 1, 8), "Standard", None, "P4", 7, 75.0, 0.15, 11.25, date(2025, 5, 23)), # Null customer_id
+        (5, "O5", date(2025, 1, 5), date(2025, 1, 9), "Express", "C5", None, 1, 120.0, 0.2, 24.0, date(2025, 5, 23)), # Null product_id
+        (6, "O6", date(2025, 1, 10), date(2025, 1, 15), "Standard", "C6", "P6", 3, 30.0, 0.1, 3.0, date(2025, 5, 23)),
+    ]
+
+    # Create the DataFrame using the local schema that allows nulls
+    df_input_for_null_handling = spark_session.createDataFrame(input_data_with_nulls, schema=test_input_schema_for_null_handling)
+    
+    reject_folder_base_path = str(tmp_path / "rejected_data")
+
+    # Patch the 'save' method of the DataFrameWriter directly
+    with patch('pyspark.sql.DataFrameWriter.save') as mock_save:
+        # We don't need to chain mocks for format, mode, option if we only care about save
+        # These methods will be called on a real DataFrameWriter object, but their results
+        # are discarded as soon as 'save' is called and mocked.
+
+        df_valid = handle_critical_id_nulls(
+            spark_session,
+            df_input_for_null_handling,
+            reject_folder_base_path,
+            file_date_str,
+            mock_dbutils
+        )
+
+        # Assertions
+        assert df_valid.count() == 2, "Expected 2 valid records."
+        assert df_valid.filter(col("row_id").isNull() | col("order_id").isNull() | \
+                                col("customer_id").isNull() | col("product_id").isNull()).count() == 0, \
+            "Valid DataFrame should not contain any records with null critical IDs."
+
+        valid_order_ids = [row.order_id for row in df_valid.collect()]
+        assert "O1" in valid_order_ids
+        assert "O6" in valid_order_ids
+        assert "O2" not in valid_order_ids
+        assert "O3" not in valid_order_ids
+        assert "O4" not in valid_order_ids
+        assert "O5" not in valid_order_ids
+        
+
+    print("handle_critical_id_nulls PASSED.")
+
+
+def test_clean_and_transform_orders_data(spark_session: SparkSession):
+    """
+    Tests clean_and_transform_orders_data function for handling nulls and rounding profit.
+    """
+    print("\n--- Testing clean_and_transform_orders_data ---")
+    
+    # Define schema for the input DataFrame (after standardization and null ID handling)
+    input_schema = StructType([
         StructField("row_id", IntegerType(), False),
         StructField("order_id", StringType(), False),
-        StructField("order_date", DateType(), True), # Your `clean_and_transform_orders_data` directly uses DateType for this
+        StructField("order_date", DateType(), True),
         StructField("ship_date", DateType(), True),
         StructField("ship_mode", StringType(), True),
         StructField("customer_id", StringType(), False),
@@ -128,136 +180,160 @@ def test_clean_and_transform_orders_data_profit_rounding_parametrized(
         StructField("price", DoubleType(), True),
         StructField("discount", DoubleType(), True),
         StructField("profit", DoubleType(), True),
-        StructField("file_date", DateType(), True) # Also required if standardize_orders_columns adds it.
+        StructField("file_date", DateType(), False) # Added file_date to match the number of fields
     ])
 
+    df_input_for_cleaning = spark_session.createDataFrame(
+        [
+            (1, "O1", date(2025, 1, 1), date(2025, 1, 5), "Standard", "C1", "P1", 10, 100.0, 0.1, 10.123, date(2025, 5, 23)), # Profit to be rounded
+            (2, "O2", None, date(2025, 1, 6), "Fast", "C2", "P2", 5, 50.0, 0.05, 5.0, date(2025, 5, 23)), # Null order_date
+            (3, "O3", date(2025, 1, 3), None, "Same Day", "C3", "P3", 2, 20.0, 0.0, 2.0, date(2025, 5, 23)), # Null ship_date
+            (4, "O4", date(2025, 1, 4), date(2025, 1, 8), None, "C4", "P4", 7, 75.0, 0.15, 11.25, date(2025, 5, 23)), # Null ship_mode
+            (5, "O5", date(2025, 1, 5), date(2025, 1, 9), "Express", "C5", "P5", None, 120.0, 0.2, 24.0, date(2025, 5, 23)), # Null quantity
+            (6, "O6", date(2025, 1, 10), date(2025, 1, 15), "Standard", "C6", "P6", 3, None, 0.1, 3.0, date(2025, 5, 23)), # Null price
+            (7, "O7", date(2025, 1, 11), date(2025, 1, 16), "Standard", "C7", "P7", 4, 40.0, None, 4.0, date(2025, 5, 23)), # Null discount
+            (8, "O8", date(2025, 1, 12), date(2025, 1, 17), "Standard", "C8", "P8", 6, 60.0, 0.1, None, date(2025, 5, 23)), # Null profit
+        ], schema=input_schema
+    )
 
-
-    data_for_cleaning_function = [
-        (
-            1,                # row_id
-            "dummy_order_id", # order_id
-            date(2024, 1, 1), # order_date (as Date object for direct schema match)
-            date(2024, 1, 5), # ship_date
-            "Standard Class", # ship_mode
-            "C_dummy",        # customer_id
-            "P_dummy",        # product_id
-            1,                # quantity
-            10.0,             # price
-            0.0,              # discount
-            input_profit,     # profit
-            date(2025, 5, 23) # file_date (dummy value for this test)
-        )
-    ]
-
-    df_input_for_cleaning_function = spark_session.createDataFrame(data_for_cleaning_function, schema=input_schema_for_cleaning)
-
-    # Call the function under test
-    df_cleaned = clean_and_transform_orders_data(df_input_for_cleaning_function)
-
-    # Collect result
-    result_profit = df_cleaned.select("profit").collect()[0]["profit"]
-
-    # Assert
-    assert result_profit == expected_profit
-
-
-
-def test_load_orders_data_saves_to_delta(spark_session: SparkSession):
-    """
-    Tests if the load_orders_data function attempts to save to a Delta table
-    with the correct table name and mode, using a mocked DataFrame input.
-    """
-    target_schema_name = "test_target_schema"
-
-    # Create a MagicMock to act as the DataFrame passed to load_orders_data
-    mock_df_to_save = MagicMock(spec=DataFrame) 
-    # Set up the chain for the mock_df_to_save's .write method
-    mock_format_chain = MagicMock()
-    mock_mode_chain = MagicMock()
-    mock_option_chain_overwriteSchema = MagicMock() # For the first .option() call
-    mock_option_chain_partitionBy = MagicMock() # For the .partitionBy() call
-
-    mock_df_to_save.write.format.return_value = mock_format_chain
-    mock_format_chain.mode.return_value = mock_mode_chain
-    mock_mode_chain.option.return_value = mock_option_chain_overwriteSchema
-    
-    # Add the mock for partitionBy. It should be called after .option("overwriteSchema", "true")
-    mock_option_chain_overwriteSchema.partitionBy.return_value = mock_option_chain_partitionBy 
-    
-    mock_option_chain_partitionBy.saveAsTable.return_value = None # saveAsTable usually returns None
-
-    # Call the function under test with the mocked DataFrame
-    load_orders_data(spark_session, target_schema_name, mock_df_to_save)
+    cleaned_df = clean_and_transform_orders_data(df_input_for_cleaning)
 
     # Assertions
-    mock_df_to_save.write.format.assert_called_once_with("delta")
-    mock_format_chain.mode.assert_called_once_with("overwrite")
+    # Check profit rounding
+    assert cleaned_df.filter(col("order_id") == "O1").select("profit").first()[0] == 10.12
+
+    # Check null coalescing for dates
+    assert cleaned_df.filter(col("order_id") == "O2").select("order_date").first()[0] == date(1900, 1, 1)
+    assert cleaned_df.filter(col("order_id") == "O3").select("ship_date").first()[0] == date(1900, 1, 1)
+
+    # Check null coalescing for string
+    assert cleaned_df.filter(col("order_id") == "O4").select("ship_mode").first()[0] == "unknown"
+
+    # Check null coalescing for integer
+    assert cleaned_df.filter(col("order_id") == "O5").select("quantity").first()[0] == 0
+
+    # Check null coalescing for double
+    assert cleaned_df.filter(col("order_id") == "O6").select("price").first()[0] == 0.0
+    assert cleaned_df.filter(col("order_id") == "O7").select("discount").first()[0] == 0.0
+    assert cleaned_df.filter(col("order_id") == "O8").select("profit").first()[0] == 0.0
+
+    print("clean_and_transform_orders_data PASSED.")
+
+def test_profit_rounding(spark_session: SparkSession):
+    """
+    Tests that the 'profit' column is correctly rounded to two decimal places
+    by the clean_and_transform_orders_data function.
+    """
+    print("\n--- Testing profit rounding in clean_and_transform_orders_data ---")
+
+    input_schema = StructType([
+        StructField("row_id", IntegerType(), False),
+        StructField("order_id", StringType(), False),
+        StructField("order_date", DateType(), False),
+        StructField("ship_date", DateType(), False),
+        StructField("ship_mode", StringType(), False),
+        StructField("customer_id", StringType(), False),
+        StructField("product_id", StringType(), False),
+        StructField("quantity", IntegerType(), False),
+        StructField("price", DoubleType(), False),
+        StructField("discount", DoubleType(), False),
+        StructField("profit", DoubleType(), True), # Profit can be null for this test
+        StructField("file_date", DateType(), False)
+    ])
+
+    test_data = [
+        (1, "O_R1", date(2025, 1, 1), date(2025, 1, 2), "Standard", "C1", "P1", 1, 10.0, 0.1, 123.456, date(2025, 5, 23)),
+        (2, "O_R2", date(2025, 1, 1), date(2025, 1, 2), "Standard", "C2", "P2", 1, 10.0, 0.1, 78.901, date(2025, 5, 23)),
+        (3, "O_R3", date(2025, 1, 1), date(2025, 1, 2), "Standard", "C3", "P3", 1, 10.0, 0.1, 50.000, date(2025, 5, 23)),
+        (4, "O_R4", date(2025, 1, 1), date(2025, 1, 2), "Standard", "C4", "P4", 1, 10.0, 0.1, 0.005, date(2025, 5, 23)), # Should round up
+        (5, "O_R5", date(2025, 1, 1), date(2025, 1, 2), "Standard", "C5", "P5", 1, 10.0, 0.1, 0.004, date(2025, 5, 23)), # Should round down
+        (6, "O_R6", date(2025, 1, 1), date(2025, 1, 2), "Standard", "C6", "P6", 1, 10.0, 0.1, None, date(2025, 5, 23)), # Null profit
+    ]
+
+    df_input = spark_session.createDataFrame(test_data, schema=input_schema)
+    cleaned_df = clean_and_transform_orders_data(df_input)
+
+    # Collect results for verification
+    results = cleaned_df.select("order_id", "profit").collect()
+    profit_map = {row.order_id: row.profit for row in results}
+
+    assert profit_map["O_R1"] == 123.46, "Profit for O_R1 not rounded correctly"
+    assert profit_map["O_R2"] == 78.90, "Profit for O_R2 not rounded correctly"
+    assert profit_map["O_R3"] == 50.00, "Profit for O_R3 not rounded correctly"
+    assert profit_map["O_R4"] == 0.01, "Profit for O_R4 not rounded correctly (should round up)"
+    assert profit_map["O_R5"] == 0.00, "Profit for O_R5 not rounded correctly (should round down)"
+    assert profit_map["O_R6"] == 0.00, "Null profit not coalesced to 0.00"
+
+    print("test_profit_rounding PASSED.")
+
+
+@pytest.mark.parametrize(
+    "row_id, order_id, order_date, ship_date, quantity, price, discount, expected_issues",
+    [
+        (101, "ORD101", date(2025, 1, 1), date(2025, 1, 5), 10, 100.0, 0.1, []), # Valid
+        (102, "ORD102", date(2025, 1, 1), date(2025, 1, 5), -5, 50.0, 0.05, ["QUANTITY_NEGATIVE"]), # Negative quantity
+        (103, "ORD103", date(2025, 1, 1), date(2025, 1, 5), 2, -20.0, 0.0, ["PRICE_NEGATIVE"]), # Negative price
+        (104, "ORD104", date(2025, 1, 1), date(2025, 1, 5), 7, 75.0, 1.5, ["DISCOUNT_OUT_OF_RANGE"]), # Discount > 1.0
+        (105, "ORD105", date(2025, 1, 1), date(2024, 12, 25), 1, 120.0, 0.2, ["SHIP_DATE_BEFORE_ORDER_DATE"]), # Ship date before order date
+        (106, "ORD106", date(2025, 1, 1), date(2025, 1, 5), 1, 10.0, -0.1, ["DISCOUNT_OUT_OF_RANGE"]), # Discount < 0.0
+        (107, "ORD107", date(2025, 1, 1), date(2025, 1, 5), -1, -10.0, 1.1, # Multiple issues
+            ["QUANTITY_NEGATIVE", "PRICE_NEGATIVE", "DISCOUNT_OUT_OF_RANGE"]),
+        (108, "ORD108", date(2025, 1, 1), date(2025, 1, 5), 5, 50.0, 0.1, ["ROW_ID_DUPLICATE_IN_BATCH"]), # Duplicate row_id (will add another record with 108)
+    ]
+)
+def test_perform_order_data_quality_checks(spark_session: SparkSession,
+                                           row_id, order_id, order_date, ship_date, quantity, price, discount,
+                                           expected_issues):
+    """
+    Tests various data quality checks using parameterized inputs for the perform_order_data_quality_checks function.
+    """
+    print(f"\n--- Testing perform_order_data_quality_checks for order_id: {order_id} ---")
+
+    # Schema for the input to DQ checks (after standardization and cleaning)
+    pre_dq_schema = StructType([
+        StructField("row_id", IntegerType(), False),
+        StructField("order_id", StringType(), False),
+        StructField("order_date", DateType(), False),
+        StructField("ship_date", DateType(), False),
+        StructField("ship_mode", StringType(), False),
+        StructField("customer_id", StringType(), False),
+        StructField("product_id", StringType(), False),
+        StructField("quantity", IntegerType(), False),
+        StructField("price", DoubleType(), False),
+        StructField("discount", DoubleType(), False),
+        StructField("profit", DoubleType(), False),
+        StructField("file_date", DateType(), False)
+    ])
+
+    current_test_data = [(
+        row_id, order_id, order_date, ship_date, "Standard", "C001", "P001", quantity, price, discount, 10.0,
+        date(2025, 5, 23)
+    )]
+
+    # Add a duplicate record if testing for ROW_ID_DUPLICATE_IN_BATCH
+    if "ROW_ID_DUPLICATE_IN_BATCH" in expected_issues:
+        current_test_data.append((
+            row_id, "DUP_" + order_id, date(2025, 1, 1), date(2025, 1, 5), "Standard", "C002", "P002", 1, 1.0, 0.0, 1.0,
+            date(2025, 5, 23)
+        ))
+
+    df_for_dq = spark_session.createDataFrame(current_test_data, pre_dq_schema)
+    df_with_dq_issues = perform_order_data_quality_checks(df_for_dq)
     
-    # Assert for the first option call
-    mock_mode_chain.option.assert_called_once_with("overwriteSchema", "true") 
-    
-    # Assert for the partitionBy call
-    mock_option_chain_overwriteSchema.partitionBy.assert_called_once_with("file_date")
+    # Collect all DQ issues for the given order_id
+    actual_issues_row = df_with_dq_issues.filter(col("order_id") == order_id).select("dq_issues").collect()
 
-    # Assert for the saveAsTable call, which is now on mock_option_chain_partitionBy
-    mock_option_chain_partitionBy.saveAsTable.assert_called_once_with(f"{target_schema_name}.orders")
+    actual_issues = []
+    if actual_issues_row and actual_issues_row[0].dq_issues: # Check if dq_issues list is not None and not empty
+        actual_issues.extend(actual_issues_row[0].dq_issues)
+    actual_issues = sorted(list(set(actual_issues))) # Ensure unique and sorted
 
+    expected_issues_sorted = sorted(expected_issues)
 
-@patch('transform_functions.ingest_orders_data_functions.load_orders_data')
-@patch('transform_functions.ingest_orders_data_functions.clean_and_transform_orders_data')
-@patch('transform_functions.ingest_orders_data_functions.standardize_orders_columns')
-@patch('transform_functions.ingest_orders_data_functions.load_raw_orders_json')
-@patch('transform_functions.ingest_orders_data_functions.add_ingestion_date')
-def test_ingest_orders_pipeline_orchestration(
-    mock_add_ingestion_date,
-    mock_load_raw_orders_json,
-    mock_standardize_orders_columns,
-    mock_clean_and_transform_orders_data,
-    mock_load_orders_data,
-    spark_session: SparkSession,
-    mock_raw_orders_df: DataFrame
-):
-    test_file_date = "2025-05-23"
-    test_raw_path = "/mnt/landing"
+    assert actual_issues == expected_issues_sorted, \
+        f"DQ issues for order_id {order_id} mismatch.\n" \
+        f"Expected: {expected_issues_sorted}\n" \
+        f"Actual: {actual_issues}"
 
-    dummy_transformed_df_before_ingestion = spark_session.createDataFrame(
-        [("O1_standard", 123.45, test_file_date, "C1", "P1")],
-        ["order_id", "profit", "file_date", "customer_id", "product_id"]
-    ).withColumn("file_date", to_date(col("file_date"), "yyyy-MM-dd")) # Ensure file_date is DateType
+    print(f"DQ check for order_id {order_id} PASSED. Issues: {actual_issues}")
 
-    mock_load_raw_orders_json.return_value = mock_raw_orders_df
-    mock_standardize_orders_columns.return_value = dummy_transformed_df_before_ingestion
-    mock_clean_and_transform_orders_data.return_value = dummy_transformed_df_before_ingestion
-
-    # Configure add_ingestion_date to actually add the column with a dynamic timestamp
-    mock_add_ingestion_date.side_effect = lambda df: df.withColumn("ingestion_date", current_timestamp())
-
-    mock_load_orders_data.return_value = None
-
-    result_df = ingest_orders_pipeline(
-        spark=spark_session,
-        file_date=test_file_date,
-        raw_folder_path=test_raw_path
-    )
-
-    # --- Assertions ---
-    mock_load_raw_orders_json.assert_called_once_with(
-        spark_session, test_file_date, test_raw_path, orders_schema
-    )
-    mock_standardize_orders_columns.assert_called_once_with(mock_raw_orders_df, test_file_date)
-
-    mock_clean_and_transform_orders_data.assert_called_once_with(dummy_transformed_df_before_ingestion)
-
-    # Assert that add_ingestion_date was called with the correct DataFrame
-    mock_add_ingestion_date.assert_called_once_with(dummy_transformed_df_before_ingestion)
-
-    assert mock_load_orders_data.call_count == 2
-    # Verify the "raw" save: it should be the df_renamed, which is the output of standardize_orders_columns
-    mock_load_orders_data.assert_any_call(spark_session, "raw", mock_standardize_orders_columns.return_value)
-    # For processed, it should receive the DataFrame *after* ingestion_date has been added by its side_effect
-    mock_load_orders_data.assert_any_call(spark_session, "processed", result_df)
-
-    assert "ingestion_date" in result_df.columns
-    assert result_df.schema["ingestion_date"].dataType == TimestampType()
-    assert result_df.count() == dummy_transformed_df_before_ingestion.count()
